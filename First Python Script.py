@@ -22,10 +22,11 @@ CUTTER_COLLECTION = "Cutters_Collection"
 ARRAY_COLLECTION = "Array_Helpers"
 ARRAY_RADIAL_MOD = "Array_Radial"
 ARRAY_LINEAR_MOD = "Array_Linear"
+CABLE_COLLECTION = "Cable_Rig"
 
-# Set while a radial operator is rebuilding, so the depsgraph handler
-# does not fire against half-written state.
-_array_sync_suspended = False
+# Set while an operator is rebuilding a rig, so the depsgraph handlers do not
+# fire against half-written state.
+_auto_sync_suspended = False
 WELD_MOD = "Smart_Weld"
 BEVEL_MOD = "Smart_Bevel"
 WEIGHTED_NORMAL_MOD = "Smart_Weighted_Normal"
@@ -619,14 +620,14 @@ def sync_radial_array(target, modifier, empty):
 
 
 @contextmanager
-def suspended_array_sync():
+def suspended_auto_sync():
     """Stop the depsgraph handler running while an operator is mid-rebuild."""
-    global _array_sync_suspended
-    _array_sync_suspended = True
+    global _auto_sync_suspended
+    _auto_sync_suspended = True
     try:
         yield
     finally:
-        _array_sync_suspended = False
+        _auto_sync_suspended = False
 
 
 @bpy.app.handlers.persistent
@@ -638,7 +639,7 @@ def sync_radial_arrays_on_update(scene, depsgraph=None):
     handler, so the stored signature gates the write and the second pass finds
     nothing to do.
     """
-    if _array_sync_suspended:
+    if _auto_sync_suspended:
         return
 
     for target, modifier, empty in iter_radial_arrays(scene):
@@ -647,6 +648,118 @@ def sync_radial_arrays_on_update(scene, depsgraph=None):
                                                                      target.matrix_world):
             continue
         sync_radial_array(target, modifier, empty)
+
+
+def cable_anchor_direction(anchor, fallback):
+    """The direction a cable leaves this connector, in world space.
+
+    Stored when the anchor is made and rotated by whatever the anchor has turned
+    through since, so re-orienting the prop swings the cable's exit with it.
+    """
+    stored = anchor.get("cable_normal")
+    if stored is None:
+        return fallback
+
+    direction = anchor.matrix_world.to_3x3() @ Vector(stored[:])
+    return direction.normalized() if direction.length > 1e-9 else fallback
+
+
+def cable_signature(cable, head, tail):
+    """What the drape was computed from, for change detection."""
+    values = [round(float(getattr(cable, "cable_sag", 0.0)), 6),
+              round(float(getattr(cable, "cable_lead", 0.0)), 6)]
+    for anchor in (head, tail):
+        values += [round(value, 6) for row in anchor.matrix_world for value in row]
+    return values
+
+
+def redrape_cable(cable):
+    """Rebuild a cable's curve from its two anchors and its stored parameters.
+
+    Three control points rather than two: the ends carry the connector's exit
+    direction and the middle carries the droop. The curve passes through its
+    control points, so the sag value is the droop you get, with no correction
+    factor, and the cable leaves the jack along its axis instead of kinking
+    downwards the moment it emerges.
+    """
+    head_anchor = cable.get("cable_head")
+    tail_anchor = cable.get("cable_tail")
+    if head_anchor is None or tail_anchor is None:
+        return False
+
+    curve = cable.data
+    if not curve.splines or curve.splines[0].type != 'BEZIER':
+        return False
+    spline = curve.splines[0]
+    if len(spline.bezier_points) != 3:
+        return False
+
+    start = head_anchor.matrix_world.translation.copy()
+    end = tail_anchor.matrix_world.translation.copy()
+    span = end - start
+    if span.length < 1e-9:
+        return False
+
+    along = span.normalized()
+    droop = float(getattr(cable, "cable_sag", 0.15)) * span.length
+    reach = float(getattr(cable, "cable_lead", 0.15)) * span.length
+
+    head_dir = cable_anchor_direction(head_anchor, along)
+    tail_dir = cable_anchor_direction(tail_anchor, -along)
+
+    head, middle, tail = spline.bezier_points
+    for point in (head, tail):
+        point.handle_left_type = 'FREE'
+        point.handle_right_type = 'FREE'
+    middle.handle_left_type = 'AUTO'
+    middle.handle_right_type = 'AUTO'
+
+    head.co = start
+    head.handle_right = start + head_dir * reach
+    head.handle_left = start - head_dir * reach
+
+    tail.co = end
+    tail.handle_left = end + tail_dir * reach
+    tail.handle_right = end - tail_dir * reach
+
+    middle.co = (start + end) * 0.5 + Vector((0.0, 0.0, -droop))
+
+    cable["cable_sig"] = cable_signature(cable, head_anchor, tail_anchor)
+    return True
+
+
+def _update_cable(self, context):
+    """Re-hang this cable the moment its slider moves."""
+    with suspended_auto_sync():
+        redrape_cable(self)
+
+
+def iter_cables(scene):
+    for cable in scene.objects:
+        if cable.type != 'CURVE':
+            continue
+        if cable.get("cable_head") is None or cable.get("cable_tail") is None:
+            continue
+        yield cable
+
+
+@bpy.app.handlers.persistent
+def redrape_cables_on_update(scene, depsgraph=None):
+    """Re-hang cables whose anchors have moved or whose sag has changed.
+
+    Hook modifiers would carry the ends along but drag the old shape with them,
+    leaving the droop wrong for the new span. Recomputing gives a cable that is
+    correctly hung for wherever its connectors have ended up.
+    """
+    if _auto_sync_suspended:
+        return
+
+    for cable in iter_cables(scene):
+        head, tail = cable["cable_head"], cable["cable_tail"]
+        stored = cable.get("cable_sig")
+        if stored is not None and list(stored[:]) == cable_signature(cable, head, tail):
+            continue
+        redrape_cable(cable)
 
 
 def resolve_array_axis(context, mode):
@@ -951,7 +1064,7 @@ class OBJECT_OT_radial_array(bpy.types.Operator):
         empty["array_axis"] = tuple(axis.normalized())
         empty.parent = None
 
-        with suspended_array_sync():
+        with suspended_auto_sync():
             sync_radial_array(target, modifier, empty)
         stash_in_collection(context, empty,
                             get_helper_collection(context, ARRAY_COLLECTION, hide_on_create=True))
@@ -1062,7 +1175,7 @@ CABLE_PROFILES = [
 
 
 class OBJECT_OT_drop_cable(bpy.types.Operator):
-    """Hang a cable between two selected points"""
+    """Hang a live cable between two selected points"""
     bl_idname = "object.drop_cable"
     bl_label = "Drop Cable"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1074,6 +1187,13 @@ class OBJECT_OT_drop_cable(bpy.types.Operator):
                     "same on a short jumper and a long power run",
         default=0.15, min=0.0, max=3.0, precision=3, step=1.0,
     )
+    lead: FloatProperty(
+        name="Connector Lead",
+        description="How far the cable runs straight out of the connector before "
+                    "it starts to fall, as a fraction of the span. Zero kinks it "
+                    "downwards right at the plug",
+        default=0.18, min=0.0, max=1.0, precision=3, step=1.0,
+    )
     radius: FloatProperty(
         name="Radius", description="Cable thickness",
         default=0.01, min=0.00001, max=1.0, precision=4, step=0.1, subtype='DISTANCE',
@@ -1083,7 +1203,7 @@ class OBJECT_OT_drop_cable(bpy.types.Operator):
         name="Length Resolution",
         description="Segments along the cable. Lower is cheaper and reads fine "
                     "on a cable that is mostly silhouette",
-        default=6, min=1, max=32,
+        default=8, min=1, max=32,
     )
 
     @classmethod
@@ -1091,54 +1211,83 @@ class OBJECT_OT_drop_cable(bpy.types.Operator):
         return context.mode in {'EDIT_MESH', 'OBJECT'}
 
     def execute(self, context):
-        points = self.read_endpoints(context)
-        if len(points) < 2:
+        endpoints = self.read_endpoints(context)
+        if len(endpoints) < 2:
             self.report({'ERROR'}, "Select two vertices, two faces, or two objects.")
             return {'CANCELLED'}
 
-        start, end = points[0], points[1]
+        (start, head_normal, head_source), (end, tail_normal, tail_source) = endpoints[:2]
         if (end - start).length < 1e-6:
             self.report({'ERROR'}, "The two points are in the same place.")
             return {'CANCELLED'}
 
-        self.build_cable(context, start, end)
-        self.report({'INFO'}, f"Cable dropped over {(end - start).length:.3f} "
-                              f"with {self.sag:.0%} sag.")
+        with suspended_auto_sync():
+            head = self.build_anchor(context, "CableEnd", start, head_normal, head_source)
+            tail = self.build_anchor(context, "CableEnd", end, tail_normal, tail_source)
+            cable = self.build_cable(context, head, tail)
+            # The anchors were just parented, so their world matrices have to be
+            # resolved before the drape can read the ends off them.
+            context.view_layer.update()
+            hung = redrape_cable(cable)
+
+        if not hung:
+            self.report({'ERROR'}, "Could not hang the cable.")
+            return {'CANCELLED'}
+
+        anchored = sum(1 for source in (head_source, tail_source) if source is not None)
+        self.report({'INFO'}, f"Cable hung over {(end - start).length:.3f}, "
+                              f"{anchored} end(s) anchored to their source.")
         return {'FINISHED'}
 
     @staticmethod
     def read_endpoints(context):
-        """Two world-space points, from whichever selection the user has made."""
+        """(world point, world normal or None, source object) for each end."""
         if context.mode == 'EDIT_MESH':
             obj = context.active_object
             if obj is None or obj.type != 'MESH':
                 return []
 
             bm = bmesh.from_edit_mesh(obj.data)
+            bm.normal_update()
+            # Normals need the inverse transpose, or a scaled prop sends the
+            # cable out at the wrong angle to its own surface.
+            normals = obj.matrix_world.to_3x3().inverted_safe().transposed()
+
             faces = [face for face in bm.faces if face.select]
             if len(faces) >= 2:
-                return [obj.matrix_world @ face.calc_center_median() for face in faces[:2]]
+                return [(obj.matrix_world @ face.calc_center_median(),
+                         (normals @ face.normal).normalized(), obj) for face in faces[:2]]
 
             verts = [vert for vert in bm.verts if vert.select]
-            return [obj.matrix_world @ vert.co.copy() for vert in verts[:2]]
+            return [(obj.matrix_world @ vert.co.copy(),
+                     (normals @ vert.normal).normalized(), obj) for vert in verts[:2]]
 
-        return [obj.matrix_world.translation.copy() for obj in context.selected_objects[:2]]
+        return [(obj.matrix_world.translation.copy(), None, obj)
+                for obj in context.selected_objects[:2]]
 
-    def build_cable(self, context, start, end):
-        """A capped Bezier tube drooping between the two points.
+    @staticmethod
+    def build_anchor(context, name, position, normal, source):
+        """A grabbable empty at one end, riding along with the prop it came from."""
+        anchor = bpy.data.objects.new(name, None)
+        anchor.empty_display_type = 'SPHERE'
+        anchor.empty_display_size = 0.02
+        context.scene.collection.objects.link(anchor)
 
-        Sag is applied by pulling both interpolation handles straight down in
-        world Z. For a cubic Bezier the midpoint sits three quarters of the way
-        to the handles, so the handle drop is scaled by 4/3: the slider then
-        means the droop you actually get rather than an arbitrary handle length.
+        if source is not None:
+            # The parent inverse cancels the parent's current matrix, so the
+            # basis is the world matrix outright: no evaluated state involved.
+            anchor.parent = source
+            anchor.matrix_parent_inverse = source.matrix_world.inverted_safe()
+        anchor.matrix_basis = Matrix.Translation(position)
 
-        Points are written in world space on an untransformed object, so the
-        cable hangs along world down whatever the source geometry is rotated to.
-        """
-        span = end - start
-        drop = Vector((0.0, 0.0, -self.sag * span.length * 4.0 / 3.0))
-        reach = span / 3.0
+        if normal is not None:
+            anchor["cable_normal"] = tuple(normal)
 
+        stash_in_collection(context, anchor,
+                            get_helper_collection(context, CABLE_COLLECTION))
+        return anchor
+
+    def build_cable(self, context, head, tail):
         curve = bpy.data.curves.new("Cable", 'CURVE')
         curve.dimensions = '3D'
         curve.resolution_u = self.resolution
@@ -1151,24 +1300,37 @@ class OBJECT_OT_drop_cable(bpy.types.Operator):
         curve.use_fill_caps = True
 
         spline = curve.splines.new('BEZIER')
-        spline.bezier_points.add(1)
-
-        head, tail = spline.bezier_points[0], spline.bezier_points[1]
-        for point in (head, tail):
-            point.handle_left_type = 'FREE'
-            point.handle_right_type = 'FREE'
-
-        head.co = start
-        head.handle_right = start + reach + drop
-        head.handle_left = start - reach
-
-        tail.co = end
-        tail.handle_left = end - reach + drop
-        tail.handle_right = end + reach
+        spline.bezier_points.add(2)
 
         cable = bpy.data.objects.new(curve.name, curve)
         context.scene.collection.objects.link(cable)
+        cable["cable_head"] = head
+        cable["cable_tail"] = tail
+        cable.cable_sag = self.sag
+        cable.cable_lead = self.lead
         return cable
+
+
+class OBJECT_OT_redrape_cables(bpy.types.Operator):
+    """Re-hang every live cable from its anchors"""
+    bl_idname = "object.redrape_cables"
+    bl_label = "Re-drape Cables"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(True for _ in iter_cables(context.scene))
+
+    def execute(self, context):
+        with suspended_auto_sync():
+            hung = sum(1 for cable in iter_cables(context.scene) if redrape_cable(cable))
+
+        if not hung:
+            self.report({'WARNING'}, "No live cables to re-hang.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Re-hung {hung} cable(s).")
+        return {'FINISHED'}
 
 
 # --- CUTTER VISIBILITY --------------------------------------------------------
@@ -1866,7 +2028,18 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         col.operator(OBJECT_OT_sync_radial_arrays.bl_idname, text="Sync Radial",
                      icon='FILE_REFRESH')
 
-        col.operator(OBJECT_OT_drop_cable.bl_idname, text="Drop Cable", icon='FORCE_CURVE')
+        row = col.row(align=True)
+        row.operator(OBJECT_OT_drop_cable.bl_idname, text="Drop Cable", icon='FORCE_CURVE')
+        row.operator(OBJECT_OT_redrape_cables.bl_idname, text="", icon='FILE_REFRESH')
+
+        active = context.active_object
+        if active is not None and active.get("cable_head") is not None:
+            box = layout.box()
+            box.label(text=active.name, icon='OUTLINER_OB_CURVE')
+            box.prop(active, "cable_sag")
+            box.prop(active, "cable_lead")
+            box.prop(active.data, "bevel_depth", text="Radius")
+            box.prop(active.data, "resolution_u", text="Resolution")
 
         layout.separator()
 
@@ -2022,6 +2195,7 @@ classes = (
     OBJECT_OT_snap_to_cursor,
     OBJECT_OT_origin_to_bottom,
     OBJECT_OT_drop_cable,
+    OBJECT_OT_redrape_cables,
     OBJECT_OT_radial_array,
     OBJECT_OT_linear_array,
     OBJECT_OT_sync_radial_arrays,
@@ -2149,6 +2323,23 @@ def unregister_keymaps():
     addon_keymaps.clear()
 
 
+OBJECT_PROPS = {
+    "cable_sag": FloatProperty(
+        name="Sag",
+        description="Droop at the middle, as a fraction of the distance spanned",
+        default=0.15, min=0.0, max=3.0, precision=3, step=1.0,
+        update=_update_cable,
+    ),
+    "cable_lead": FloatProperty(
+        name="Connector Lead",
+        description="How far the cable runs straight out of the connector before "
+                    "it starts to fall, as a fraction of the span",
+        default=0.18, min=0.0, max=1.0, precision=3, step=1.0,
+        update=_update_cable,
+    ),
+}
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -2156,15 +2347,20 @@ def register():
     for name, prop in SCENE_PROPS.items():
         setattr(bpy.types.Scene, name, prop)
 
+    for name, prop in OBJECT_PROPS.items():
+        setattr(bpy.types.Object, name, prop)
+
     register_keymaps()
 
-    if sync_radial_arrays_on_update not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(sync_radial_arrays_on_update)
+    for handler in (sync_radial_arrays_on_update, redrape_cables_on_update):
+        if handler not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(handler)
 
 
 def unregister():
-    if sync_radial_arrays_on_update in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(sync_radial_arrays_on_update)
+    for handler in (sync_radial_arrays_on_update, redrape_cables_on_update):
+        if handler in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(handler)
 
     unregister_keymaps()
 
@@ -2175,6 +2371,10 @@ def unregister():
     for name in SCENE_PROPS:
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
+
+    for name in OBJECT_PROPS:
+        if hasattr(bpy.types.Object, name):
+            delattr(bpy.types.Object, name)
 
 
 if __name__ == "__main__":
