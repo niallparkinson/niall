@@ -96,6 +96,49 @@ def get_cutter_collection(context):
     return coll
 
 
+def find_layer_collection(layer_collection, name):
+    """Depth-first search for the LayerCollection wrapping a named collection.
+
+    view_layer.layer_collection is a tree mirroring the scene's collection
+    hierarchy, and only the LayerCollection carries the per-view-layer eye
+    toggle, so the collection datablock alone is not enough to find it.
+    """
+    if layer_collection.collection.name == name:
+        return layer_collection
+    for child in layer_collection.children:
+        found = find_layer_collection(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def get_cutter_layer_collection(context):
+    """The cutter collection's LayerCollection, or None if it does not exist yet."""
+    if bpy.data.collections.get(CUTTER_COLLECTION) is None:
+        return None
+    return find_layer_collection(context.view_layer.layer_collection, CUTTER_COLLECTION)
+
+
+def cutters_visible(layer_collection):
+    """True while any cutter is actually on screen.
+
+    Deliberately not just the collection's eye: a cutter hidden individually
+    with H stays hidden when the collection is revealed, so testing the
+    collection alone would make the toggle look broken. Any visible cutter means
+    the next click should hide.
+    """
+    if layer_collection is None or layer_collection.hide_viewport or layer_collection.exclude:
+        return False
+    return any(not obj.hide_get() for obj in layer_collection.collection.objects)
+
+
+def lock_cutter_render_visibility(collection):
+    """Re-assert that cutters never reach a render, whatever the viewport shows."""
+    collection.hide_render = True
+    for obj in collection.objects:
+        obj.hide_render = True
+
+
 def stash_operand(context, operand):
     """Hide a boolean operand in the cutter collection and set it to wireframe.
 
@@ -233,6 +276,67 @@ def sanitize_filename(name):
 
 def selected_meshes(context):
     return [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+
+# --- CUTTER VISIBILITY --------------------------------------------------------
+
+class OBJECT_OT_toggle_cutters(bpy.types.Operator):
+    """Show or hide every cutter without touching anything else in the scene"""
+    bl_idname = "object.toggle_cutters"
+    bl_label = "Toggle Cutters"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # No selection requirement: this has to work whatever is under the cursor.
+        return bpy.data.collections.get(CUTTER_COLLECTION) is not None
+
+    def execute(self, context):
+        layer_coll = get_cutter_layer_collection(context)
+        if layer_coll is None:
+            self.report({'WARNING'}, f"{CUTTER_COLLECTION} is not linked to this view layer.")
+            return {'CANCELLED'}
+
+        collection = layer_coll.collection
+        hiding = cutters_visible(layer_coll)
+
+        # Only ever the eye. Never exclude: that pulls the collection out of the
+        # view layer, which is a far heavier operation than hiding a display,
+        # and clearing it is the only safe direction to move it in.
+        if layer_coll.exclude:
+            layer_coll.exclude = False
+
+        layer_coll.hide_viewport = hiding
+        for obj in collection.objects:
+            obj.hide_set(hiding)
+
+        # Viewport state is the only thing this operator owns.
+        lock_cutter_render_visibility(collection)
+
+        count = len(collection.objects)
+        self.report({'INFO'}, f"{'Hid' if hiding else 'Revealed'} {count} cutter(s).")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_cutter_display(bpy.types.Operator):
+    """Switch cutters between wireframe and solid display"""
+    bl_idname = "object.cutter_display"
+    bl_label = "Toggle Cutter Display"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        collection = bpy.data.collections.get(CUTTER_COLLECTION)
+        return collection is not None and len(collection.objects) > 0
+
+    def execute(self, context):
+        collection = bpy.data.collections[CUTTER_COLLECTION]
+        to_solid = any(obj.display_type == 'WIRE' for obj in collection.objects)
+        for obj in collection.objects:
+            obj.display_type = 'SOLID' if to_solid else 'WIRE'
+
+        self.report({'INFO'}, f"Cutters set to {'solid' if to_solid else 'wireframe'}.")
+        return {'FINISHED'}
 
 
 # --- BOOLEAN & CUTTER OPERATORS ----------------------------------------------
@@ -686,6 +790,9 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
 
+        self.draw_cutter_toggle(context, layout)
+        layout.separator()
+
         layout.label(text="Booleans:", icon='MOD_BOOLEAN')
         col = layout.column(align=True)
         col.scale_y = 1.5
@@ -738,8 +845,35 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="High Poly").export_type = 'HIGH'
         row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="Low Poly").export_type = 'LOW'
 
+    @staticmethod
+    def draw_cutter_toggle(context, layout):
+        layer_coll = get_cutter_layer_collection(context)
+        collection = bpy.data.collections.get(CUTTER_COLLECTION)
+
+        if collection is None:
+            row = layout.row()
+            row.enabled = False
+            row.label(text="No cutters yet", icon='GHOST_DISABLED')
+            return
+
+        visible = cutters_visible(layer_coll)
+
+        row = layout.row()
+        row.scale_y = 2.0
+        row.operator(
+            OBJECT_OT_toggle_cutters.bl_idname,
+            text=f"Hide Cutters ({len(collection.objects)})" if visible else "Show Cutters",
+            icon='HIDE_OFF' if visible else 'HIDE_ON',
+        )
+
+        sub = layout.row()
+        sub.enabled = visible
+        sub.operator(OBJECT_OT_cutter_display.bl_idname, text="Wire / Solid", icon='SHADING_WIRE')
+
 
 classes = (
+    OBJECT_OT_toggle_cutters,
+    OBJECT_OT_cutter_display,
     OBJECT_OT_smart_difference,
     OBJECT_OT_smart_slice,
     OBJECT_OT_smart_union,
@@ -798,6 +932,31 @@ SCENE_PROPS = {
 }
 
 
+# Default hotkey for the cutter toggle. Change the last three arguments in
+# register_keymaps() to rebind, or clear it in Preferences > Keymap > Add-ons.
+addon_keymaps = []
+
+
+def register_keymaps():
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig is None:
+        return  # Background mode has no addon keyconfig to bind into.
+
+    keymap = keyconfig.keymaps.new(name='Object Mode', space_type='EMPTY')
+    item = keymap.keymap_items.new(
+        OBJECT_OT_toggle_cutters.bl_idname, 'H', 'PRESS', ctrl=True, shift=True,
+    )
+    addon_keymaps.append((keymap, item))
+
+
+def unregister_keymaps():
+    # Remove exactly the items this addon added; leaving them behind is the
+    # classic way an addon breaks the user's keymap after a reload.
+    for keymap, item in addon_keymaps:
+        keymap.keymap_items.remove(item)
+    addon_keymaps.clear()
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -805,8 +964,12 @@ def register():
     for name, prop in SCENE_PROPS.items():
         setattr(bpy.types.Scene, name, prop)
 
+    register_keymaps()
+
 
 def unregister():
+    unregister_keymaps()
+
     # Classes come off first: the panel's draw() reads these scene properties.
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
