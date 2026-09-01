@@ -8,6 +8,7 @@ bl_info = {
     "category": "Object",
 }
 
+import math
 import os
 import re
 from contextlib import contextmanager
@@ -18,6 +19,9 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from mathutils import Matrix, Vector
 
 CUTTER_COLLECTION = "Cutters_Collection"
+ARRAY_COLLECTION = "Array_Helpers"
+ARRAY_RADIAL_MOD = "Array_Radial"
+ARRAY_LINEAR_MOD = "Array_Linear"
 WELD_MOD = "Smart_Weld"
 BEVEL_MOD = "Smart_Bevel"
 WEIGHTED_NORMAL_MOD = "Smart_Weighted_Normal"
@@ -87,13 +91,36 @@ def sole_active(context, obj):
                 bpy.ops.object.mode_set(mode=prev_mode)
 
 
-def get_cutter_collection(context):
-    coll = bpy.data.collections.get(CUTTER_COLLECTION)
-    if coll is None:
-        coll = bpy.data.collections.new(CUTTER_COLLECTION)
-        context.scene.collection.children.link(coll)
-        coll.hide_render = True
+def get_helper_collection(context, name, hide_on_create=False):
+    """Fetch or create a hidden utility collection linked to the scene root."""
+    coll = bpy.data.collections.get(name)
+    if coll is not None:
+        return coll
+
+    coll = bpy.data.collections.new(name)
+    context.scene.collection.children.link(coll)
+    coll.hide_render = True
+
+    if hide_on_create:
+        layer = find_layer_collection(context.view_layer.layer_collection, name)
+        if layer is not None:
+            # The eye only, never exclude: excluded objects leave the view layer,
+            # and an array offset object has to stay evaluated to drive the array.
+            layer.hide_viewport = True
     return coll
+
+
+def get_cutter_collection(context):
+    return get_helper_collection(context, CUTTER_COLLECTION)
+
+
+def stash_in_collection(context, obj, collection):
+    """Move an object so it lives only in the given collection."""
+    if obj.name not in collection.objects:
+        collection.objects.link(obj)
+    for other in obj.users_collection:
+        if other is not collection:
+            other.objects.unlink(obj)
 
 
 def find_layer_collection(layer_collection, name):
@@ -145,13 +172,7 @@ def stash_operand(context, operand):
     Union operands are not cutters, but they need identical treatment, so they
     share the one collection rather than proliferating bookkeeping.
     """
-    coll = get_cutter_collection(context)
-    if operand.name not in coll.objects:
-        coll.objects.link(operand)
-    # users_collection is a tuple snapshot, so unlinking while iterating is safe.
-    for other in operand.users_collection:
-        if other is not coll:
-            other.objects.unlink(operand)
+    stash_in_collection(context, operand, get_cutter_collection(context))
     operand.display_type = 'WIRE'
     operand.hide_render = True
 
@@ -536,6 +557,66 @@ def panel_tube_geometry(frames, closed, width, depth, overshoot):
     return vertices, faces
 
 
+def pivot_rotation_matrix(pivot, axis, angle):
+    """World-space transform that rotates by angle about an arbitrary axis line."""
+    return (Matrix.Translation(pivot)
+            @ Matrix.Rotation(angle, 4, axis)
+            @ Matrix.Translation(-pivot))
+
+
+def sync_radial_empty(empty):
+    """Rebuild an offset empty from the array count currently on its parent.
+
+    The Array modifier applies inverse(object) @ offset_object once per copy, so
+    the empty has to hold R @ object_matrix, where R rotates about the pivot
+    line. Placing the empty at the pivot with a bare rotation only produces a
+    ring when the object's origin already sits on the pivot; anywhere else it
+    smears the copies across different radii.
+    """
+    target = empty.parent
+    if target is None:
+        return False
+
+    modifier = target.modifiers.get(ARRAY_RADIAL_MOD)
+    if modifier is None or "array_pivot" not in empty or "array_axis" not in empty:
+        return False
+
+    matrix = target.matrix_world
+    # Pivot and axis are stored in the target's local space so the ring follows
+    # the object when it is moved, rotated or scaled.
+    pivot = matrix @ Vector(empty["array_pivot"][:])
+    axis = (matrix.to_3x3() @ Vector(empty["array_axis"][:]))
+    if axis.length < 1e-9:
+        return False
+
+    angle = 2.0 * math.pi / max(modifier.count, 1)
+    empty.matrix_world = pivot_rotation_matrix(pivot, axis.normalized(), angle) @ matrix
+    return True
+
+
+def resolve_array_axis(context, mode):
+    """Rotation axis in world space for the chosen mode."""
+    if mode == 'CURSOR':
+        # Pairs with Align Cursor to Face: the cursor's Z is the surface normal,
+        # which is the axis a ring of bolts on that panel should turn about.
+        return (context.scene.cursor.matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+
+    if mode == 'VIEW':
+        space = context.space_data
+        region_3d = getattr(space, "region_3d", None) if space else None
+        if region_3d is not None:
+            direction = region_3d.view_rotation @ Vector((0.0, 0.0, 1.0))
+            dominant = max(range(3), key=lambda index: abs(direction[index]))
+            axis = Vector((0.0, 0.0, 0.0))
+            axis[dominant] = math.copysign(1.0, direction[dominant])
+            return axis
+        return Vector((0.0, 0.0, 1.0))
+
+    axis = Vector((0.0, 0.0, 0.0))
+    axis["XYZ".index(mode)] = 1.0
+    return axis
+
+
 def sanitize_filename(name):
     cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
     return cleaned or "Mesh"
@@ -723,6 +804,166 @@ class OBJECT_OT_origin_to_bottom(bpy.types.Operator):
         context.view_layer.update()
         for child, child_matrix in children:
             child.matrix_world = child_matrix
+
+
+# --- ARRAYS -------------------------------------------------------------------
+
+class OBJECT_OT_radial_array(bpy.types.Operator):
+    """Array the active object in a ring around the 3D cursor"""
+    bl_idname = "object.radial_array"
+    bl_label = "Radial Array"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    count: IntProperty(
+        name="Count", description="Copies around the full circle",
+        default=6, min=2, max=256,
+    )
+    axis_mode: EnumProperty(
+        name="Axis",
+        items=[
+            ('CURSOR', "Cursor Z", "Turn about the 3D cursor's Z, which Align "
+                                   "Cursor to Face points along the surface normal"),
+            ('VIEW', "View", "Turn about the world axis closest to the view direction"),
+            ('X', "X", "Turn about world X"),
+            ('Y', "Y", "Turn about world Y"),
+            ('Z', "Z", "Turn about world Z"),
+        ],
+        default='CURSOR',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and context.active_object is not None
+
+    def execute(self, context):
+        target = context.active_object
+        axis = resolve_array_axis(context, self.axis_mode)
+        if axis.length < 1e-9:
+            self.report({'ERROR'}, "Could not resolve a rotation axis.")
+            return {'CANCELLED'}
+
+        modifier = (target.modifiers.get(ARRAY_RADIAL_MOD)
+                    or target.modifiers.new(name=ARRAY_RADIAL_MOD, type='ARRAY'))
+        modifier.count = self.count
+        modifier.use_relative_offset = False
+        modifier.use_constant_offset = False
+        modifier.use_object_offset = True
+
+        empty = modifier.offset_object
+        if empty is None or empty.type != 'EMPTY':
+            empty = bpy.data.objects.new(f"ArrayPivot_{target.name}", None)
+            empty.empty_display_type = 'PLAIN_AXES'
+            empty.empty_display_size = 0.1
+            context.scene.collection.objects.link(empty)
+            modifier.offset_object = empty
+
+        inverse = target.matrix_world.inverted_safe()
+        empty["array_pivot"] = tuple(inverse @ context.scene.cursor.location)
+        empty["array_axis"] = tuple((inverse.to_3x3() @ axis).normalized())
+
+        # Parenting keeps the relative transform fixed, so moving or rotating the
+        # object carries the whole ring with it instead of tearing it apart.
+        if empty.parent is not target:
+            empty.parent = target
+            empty.matrix_parent_inverse = inverse
+        context.view_layer.update()
+
+        sync_radial_empty(empty)
+        stash_in_collection(context, empty,
+                            get_helper_collection(context, ARRAY_COLLECTION, hide_on_create=True))
+        sort_post_boolean_stack(target)
+
+        self.report({'INFO'}, f"Radial array of {self.count} about the 3D cursor.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_linear_array(bpy.types.Operator):
+    """Array the active object in a straight run"""
+    bl_idname = "object.linear_array"
+    bl_label = "Linear Array"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    count: IntProperty(name="Count", default=4, min=1, max=256)
+    axis_mode: EnumProperty(
+        name="Axis",
+        items=[('X', "X", "Along local X"), ('Y', "Y", "Along local Y"),
+               ('Z', "Z", "Along local Z")],
+        default='X',
+    )
+    spacing_mode: EnumProperty(
+        name="Spacing",
+        items=[
+            ('RELATIVE', "Relative", "Multiples of the object's own bounding box, "
+                                     "so the run rescales with the object"),
+            ('CONSTANT', "Constant", "A fixed distance between copies"),
+        ],
+        default='RELATIVE',
+    )
+    factor: FloatProperty(name="Factor", default=1.25, min=-10.0, max=10.0)
+    distance: FloatProperty(
+        name="Distance", default=0.1, min=-10.0, max=10.0,
+        precision=4, step=0.1, subtype='DISTANCE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and context.active_object is not None
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "count")
+        layout.prop(self, "axis_mode")
+        layout.prop(self, "spacing_mode")
+        layout.prop(self, "factor" if self.spacing_mode == 'RELATIVE' else "distance")
+
+    def execute(self, context):
+        target = context.active_object
+        index = "XYZ".index(self.axis_mode)
+
+        modifier = (target.modifiers.get(ARRAY_LINEAR_MOD)
+                    or target.modifiers.new(name=ARRAY_LINEAR_MOD, type='ARRAY'))
+        modifier.count = self.count
+        modifier.use_object_offset = False
+
+        relative = self.spacing_mode == 'RELATIVE'
+        modifier.use_relative_offset = relative
+        modifier.use_constant_offset = not relative
+        for slot in range(3):
+            modifier.relative_offset_displace[slot] = 0.0
+            modifier.constant_offset_displace[slot] = 0.0
+        if relative:
+            modifier.relative_offset_displace[index] = self.factor
+        else:
+            modifier.constant_offset_displace[index] = self.distance
+
+        sort_post_boolean_stack(target)
+
+        self.report({'INFO'}, f"Linear array of {self.count} along {self.axis_mode}.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_sync_radial_arrays(bpy.types.Operator):
+    """Re-space every radial array from its current modifier count"""
+    bl_idname = "object.sync_radial_arrays"
+    bl_label = "Sync Radial Arrays"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bpy.data.collections.get(ARRAY_COLLECTION) is not None
+
+    def execute(self, context):
+        collection = bpy.data.collections.get(ARRAY_COLLECTION)
+        # The redo panel keeps count and spacing in step while it is open. This
+        # is for afterwards, when the count is changed in the modifier stack.
+        synced = sum(1 for empty in collection.objects if sync_radial_empty(empty))
+        if not synced:
+            self.report({'WARNING'}, "No radial arrays to sync.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Re-spaced {synced} radial array(s).")
+        return {'FINISHED'}
 
 
 # --- CUTTER VISIBILITY --------------------------------------------------------
@@ -1407,6 +1648,17 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
 
         layout.separator()
 
+        layout.label(text="Arrays:", icon='MOD_ARRAY')
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        row = col.row(align=True)
+        row.operator(OBJECT_OT_radial_array.bl_idname, text="Radial")
+        row.operator(OBJECT_OT_linear_array.bl_idname, text="Linear")
+        col.operator(OBJECT_OT_sync_radial_arrays.bl_idname, text="Sync Radial",
+                     icon='FILE_REFRESH')
+
+        layout.separator()
+
         layout.label(text="Shading & Edges:", icon='MOD_BEVEL')
         row = layout.row()
         row.scale_y = 1.5
@@ -1558,6 +1810,9 @@ classes = (
     MESH_OT_cursor_to_face,
     OBJECT_OT_snap_to_cursor,
     OBJECT_OT_origin_to_bottom,
+    OBJECT_OT_radial_array,
+    OBJECT_OT_linear_array,
+    OBJECT_OT_sync_radial_arrays,
     OBJECT_OT_toggle_cutters,
     OBJECT_OT_cutter_display,
     OBJECT_OT_smart_difference,
