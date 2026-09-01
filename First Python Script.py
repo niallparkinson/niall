@@ -22,6 +22,10 @@ CUTTER_COLLECTION = "Cutters_Collection"
 ARRAY_COLLECTION = "Array_Helpers"
 ARRAY_RADIAL_MOD = "Array_Radial"
 ARRAY_LINEAR_MOD = "Array_Linear"
+
+# Set while a radial operator is rebuilding, so the depsgraph handler
+# does not fire against half-written state.
+_array_sync_suspended = False
 WELD_MOD = "Smart_Weld"
 BEVEL_MOD = "Smart_Bevel"
 WEIGHTED_NORMAL_MOD = "Smart_Weighted_Normal"
@@ -590,9 +594,28 @@ def sync_radial_empty(empty):
         return False
 
     angle = 2.0 * math.pi / max(modifier.count, 1)
-    empty.matrix_world = pivot_rotation_matrix(pivot, axis.normalized(), angle) @ matrix
+    rotation = pivot_rotation_matrix(pivot, axis.normalized(), angle)
+
+    # Write matrix_basis, not matrix_world. Assigning matrix_world makes Blender
+    # back-solve the basis through the parent's *evaluated* matrix, which is
+    # mid-flight while the redo panel is re-running the operator, so the empty
+    # picked up a basis derived from a stale parent. With the parent inverse
+    # held at identity, basis is exactly the offset the modifier consumes and
+    # depends on nothing the depsgraph has yet to catch up on.
+    empty.matrix_basis = matrix.inverted_safe() @ rotation @ matrix
     empty["array_count"] = modifier.count
     return True
+
+
+@contextmanager
+def suspended_array_sync():
+    """Stop the depsgraph handler running while an operator is mid-rebuild."""
+    global _array_sync_suspended
+    _array_sync_suspended = True
+    try:
+        yield
+    finally:
+        _array_sync_suspended = False
 
 
 @bpy.app.handlers.persistent
@@ -611,7 +634,7 @@ def sync_radial_arrays_on_update(scene, depsgraph=None):
     The second pass finds nothing to do and stops.
     """
     collection = bpy.data.collections.get(ARRAY_COLLECTION)
-    if collection is None:
+    if _array_sync_suspended or collection is None:
         return
 
     for empty in collection.objects:
@@ -892,13 +915,14 @@ class OBJECT_OT_radial_array(bpy.types.Operator):
         empty["array_axis"] = tuple((inverse.to_3x3() @ axis).normalized())
 
         # Parenting keeps the relative transform fixed, so moving or rotating the
-        # object carries the whole ring with it instead of tearing it apart.
-        if empty.parent is not target:
-            empty.parent = target
-            empty.matrix_parent_inverse = inverse
-        context.view_layer.update()
+        # object carries the whole ring with it instead of tearing it apart. The
+        # parent inverse stays at identity so the empty's basis is exactly the
+        # offset the modifier reads, with no evaluated parent state in the way.
+        empty.parent = target
+        empty.matrix_parent_inverse = Matrix.Identity(4)
 
-        sync_radial_empty(empty)
+        with suspended_array_sync():
+            sync_radial_empty(empty)
         stash_in_collection(context, empty,
                             get_helper_collection(context, ARRAY_COLLECTION, hide_on_create=True))
         sort_post_boolean_stack(target)
