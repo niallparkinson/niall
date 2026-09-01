@@ -581,39 +581,43 @@ def iter_radial_arrays(scene):
         yield target, modifier, modifier.offset_object
 
 
-def radial_signature(modifier, matrix):
-    """What the empty's placement was computed from, for change detection."""
-    return [float(modifier.count)] + [round(value, 6) for row in matrix for value in row]
+def radial_signature(modifier):
+    """What the empty's placement was computed from, for change detection.
+
+    Only the count: the placement is world space and holds no reference to the
+    target, so moving the object needs no resync.
+    """
+    return [float(modifier.count)]
 
 
 def sync_radial_array(target, modifier, empty):
     """Place the offset empty so the array sweeps a ring about the stored pivot.
 
-    The Array modifier consumes inverse(target) @ empty, so the empty must hold
-    R @ target_matrix, where R rotates about the pivot line. The conjugation by
-    the target matrix is what puts the ring around the pivot instead of spinning
-    every copy about the target's own origin.
+    The Array modifier builds its per-copy step as
 
-    The empty is deliberately left unparented. Parented, its world matrix is
-    derived through the parent's evaluated matrix, and writing either
-    matrix_world or matrix_basis then depends on depsgraph state that is still
-    in flight while the redo panel re-runs the operator. Unparented, the world
-    matrix is the basis, and the placement is exact whenever it is written.
+        inverse(target) @ empty @ target
+
+    so the empty's world matrix is applied to each copy's *world* position. It
+    therefore has to be the world-space step itself: the rotation about the
+    pivot line, and nothing more. Composing it with the target's matrix adds a
+    second copy of that transform per step, which walks the copies outwards in a
+    spiral instead of around a ring.
+
+    Because the step is pure world space, the empty is independent of the
+    target: moving the object slides it around the same fixed pivot, which is
+    what pinning the pivot to the 3D cursor should mean.
     """
     if "array_pivot" not in empty or "array_axis" not in empty:
         return False
 
-    matrix = target.matrix_world.copy()
-    # Pivot and axis are held in the target's local space, so the ring keeps its
-    # place on the model when the model is moved, rotated or scaled.
-    pivot = matrix @ Vector(empty["array_pivot"][:])
-    axis = matrix.to_3x3() @ Vector(empty["array_axis"][:])
+    axis = Vector(empty["array_axis"][:])
     if axis.length < 1e-9:
         return False
 
     angle = 2.0 * math.pi / max(modifier.count, 1)
-    empty.matrix_world = pivot_rotation_matrix(pivot, axis.normalized(), angle) @ matrix
-    empty["array_sig"] = radial_signature(modifier, matrix)
+    empty.matrix_world = pivot_rotation_matrix(
+        Vector(empty["array_pivot"][:]), axis.normalized(), angle)
+    empty["array_sig"] = radial_signature(modifier)
     return True
 
 
@@ -632,9 +636,8 @@ def suspended_array_sync():
 def sync_radial_arrays_on_update(scene, depsgraph=None):
     """Keep every ring correct as the count changes or the target moves.
 
-    The modifier's count has no update callback, and with the empty unparented
-    nothing carries the target's movement across either, so both are watched
-    here. Writing re-triggers the handler, so the stored signature gates the
+    The modifier's count has no update callback, so nothing else notices when it
+    changes. Writing re-triggers the handler, so the stored count gates the
     write and the second pass finds nothing to do.
     """
     if _array_sync_suspended:
@@ -642,8 +645,7 @@ def sync_radial_arrays_on_update(scene, depsgraph=None):
 
     for target, modifier, empty in iter_radial_arrays(scene):
         stored = empty.get("array_sig")
-        if stored is not None and list(stored[:]) == radial_signature(modifier,
-                                                                     target.matrix_world):
+        if stored is not None and list(stored[:]) == radial_signature(modifier):
             continue
         sync_radial_array(target, modifier, empty)
 
@@ -911,12 +913,10 @@ class OBJECT_OT_radial_array(bpy.types.Operator):
             context.scene.collection.objects.link(empty)
             modifier.offset_object = empty
 
-        inverse = target.matrix_world.inverted_safe()
-        empty["array_pivot"] = tuple(inverse @ context.scene.cursor.location)
-        empty["array_axis"] = tuple((inverse.to_3x3() @ axis).normalized())
-
-        # Never parented: see sync_radial_array. Movement of the target is
-        # picked up by the depsgraph handler instead.
+        # World space: the modifier applies the empty's transform to world
+        # positions, so the pivot stays put on the cursor whatever the object does.
+        empty["array_pivot"] = tuple(context.scene.cursor.location)
+        empty["array_axis"] = tuple(axis.normalized())
         empty.parent = None
 
         with suspended_array_sync():
