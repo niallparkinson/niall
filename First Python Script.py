@@ -681,6 +681,15 @@ def selected_meshes(context):
     return [obj for obj in context.selected_objects if obj.type == 'MESH']
 
 
+# Types Blender can evaluate straight to a mesh, so a cable can be exported
+# without being converted by hand first.
+EXPORTABLE_TYPES = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
+
+
+def selected_exportable(context):
+    return [obj for obj in context.selected_objects if obj.type in EXPORTABLE_TYPES]
+
+
 # --- ORIGIN & ALIGNMENT -------------------------------------------------------
 
 # Modifiers whose result is measured from the object origin, so moving the
@@ -1039,6 +1048,127 @@ class OBJECT_OT_sync_radial_arrays(bpy.types.Operator):
 
         self.report({'INFO'}, f"Re-spaced {synced} radial array(s).")
         return {'FINISHED'}
+
+
+# --- CABLES -------------------------------------------------------------------
+
+# Blender's round bevel builds 4 * (resolution + 1) sides.
+CABLE_PROFILES = [
+    ('0', "4-sided", "Cheapest silhouette, for distant or thin wires"),
+    ('1', "8-sided", "Octagonal, the usual game-ready cable"),
+    ('2', "12-sided", "Rounder, for cables read close up"),
+    ('3', "16-sided", "Smooth, for hero pieces"),
+]
+
+
+class OBJECT_OT_drop_cable(bpy.types.Operator):
+    """Hang a cable between two selected points"""
+    bl_idname = "object.drop_cable"
+    bl_label = "Drop Cable"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    sag: FloatProperty(
+        name="Sag",
+        description="Droop at the middle, as a fraction of the distance spanned. "
+                    "Relative rather than absolute so the same value reads the "
+                    "same on a short jumper and a long power run",
+        default=0.15, min=0.0, max=3.0, precision=3, step=1.0,
+    )
+    radius: FloatProperty(
+        name="Radius", description="Cable thickness",
+        default=0.01, min=0.00001, max=1.0, precision=4, step=0.1, subtype='DISTANCE',
+    )
+    profile: EnumProperty(name="Profile", items=CABLE_PROFILES, default='1')
+    resolution: IntProperty(
+        name="Length Resolution",
+        description="Segments along the cable. Lower is cheaper and reads fine "
+                    "on a cable that is mostly silhouette",
+        default=6, min=1, max=32,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode in {'EDIT_MESH', 'OBJECT'}
+
+    def execute(self, context):
+        points = self.read_endpoints(context)
+        if len(points) < 2:
+            self.report({'ERROR'}, "Select two vertices, two faces, or two objects.")
+            return {'CANCELLED'}
+
+        start, end = points[0], points[1]
+        if (end - start).length < 1e-6:
+            self.report({'ERROR'}, "The two points are in the same place.")
+            return {'CANCELLED'}
+
+        self.build_cable(context, start, end)
+        self.report({'INFO'}, f"Cable dropped over {(end - start).length:.3f} "
+                              f"with {self.sag:.0%} sag.")
+        return {'FINISHED'}
+
+    @staticmethod
+    def read_endpoints(context):
+        """Two world-space points, from whichever selection the user has made."""
+        if context.mode == 'EDIT_MESH':
+            obj = context.active_object
+            if obj is None or obj.type != 'MESH':
+                return []
+
+            bm = bmesh.from_edit_mesh(obj.data)
+            faces = [face for face in bm.faces if face.select]
+            if len(faces) >= 2:
+                return [obj.matrix_world @ face.calc_center_median() for face in faces[:2]]
+
+            verts = [vert for vert in bm.verts if vert.select]
+            return [obj.matrix_world @ vert.co.copy() for vert in verts[:2]]
+
+        return [obj.matrix_world.translation.copy() for obj in context.selected_objects[:2]]
+
+    def build_cable(self, context, start, end):
+        """A capped Bezier tube drooping between the two points.
+
+        Sag is applied by pulling both interpolation handles straight down in
+        world Z. For a cubic Bezier the midpoint sits three quarters of the way
+        to the handles, so the handle drop is scaled by 4/3: the slider then
+        means the droop you actually get rather than an arbitrary handle length.
+
+        Points are written in world space on an untransformed object, so the
+        cable hangs along world down whatever the source geometry is rotated to.
+        """
+        span = end - start
+        drop = Vector((0.0, 0.0, -self.sag * span.length * 4.0 / 3.0))
+        reach = span / 3.0
+
+        curve = bpy.data.curves.new("Cable", 'CURVE')
+        curve.dimensions = '3D'
+        curve.resolution_u = self.resolution
+        curve.bevel_depth = self.radius
+        curve.bevel_resolution = int(self.profile)
+        curve.fill_mode = 'FULL'
+        # Capped so the cable is a closed solid rather than an open pipe. The
+        # caps arrive as unwelded duplicates; the exporter's merge pass closes
+        # them, which is what UE5 needs.
+        curve.use_fill_caps = True
+
+        spline = curve.splines.new('BEZIER')
+        spline.bezier_points.add(1)
+
+        head, tail = spline.bezier_points[0], spline.bezier_points[1]
+        for point in (head, tail):
+            point.handle_left_type = 'FREE'
+            point.handle_right_type = 'FREE'
+
+        head.co = start
+        head.handle_right = start + reach + drop
+        head.handle_left = start - reach
+
+        tail.co = end
+        tail.handle_left = end - reach + drop
+        tail.handle_right = end + reach
+
+        cable = bpy.data.objects.new(curve.name, curve)
+        context.scene.collection.objects.link(cable)
+        return cable
 
 
 # --- CUTTER VISIBILITY --------------------------------------------------------
@@ -1558,7 +1688,7 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         return context.mode == 'OBJECT' and any(
-            obj.type == 'MESH' for obj in context.selected_objects
+            obj.type in EXPORTABLE_TYPES for obj in context.selected_objects
         )
 
     def execute(self, context):
@@ -1574,9 +1704,9 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                         f"Scene Unit Scale is {unit_scale:g}; UE5 expects 1.0. "
                         "Sizes in Unreal will not match Blender.")
 
-        sources = selected_meshes(context)
+        sources = selected_exportable(context)
         if not sources:
-            self.report({'ERROR'}, "Select at least one mesh to export.")
+            self.report({'ERROR'}, "Select at least one mesh or curve to export.")
             return {'CANCELLED'}
 
         written = 0
@@ -1594,8 +1724,12 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                     cleaned_verts += verts
                     cleaned_faces += faces
 
-                # High poly is a bake source only, so it never needs UVs.
-                if self.export_type == 'LOW' and scene.smart_export_unwrap:
+                # High poly is a bake source only, so it never needs UVs. A
+                # curve already carries the straight strip UV Blender generates
+                # for it, which is exactly what a cable wants; re-unwrapping by
+                # angle would throw that away.
+                if (self.export_type == 'LOW' and scene.smart_export_unwrap
+                        and source.type == 'MESH'):
                     auto_unwrap(context, temp, scene.smart_export_seam_angle,
                                 scene.smart_export_margin, True)
                 self.write_fbx(context, temp, os.path.join(export_dir, f"{name}.fbx"))
@@ -1731,6 +1865,8 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.operator(OBJECT_OT_linear_array.bl_idname, text="Linear")
         col.operator(OBJECT_OT_sync_radial_arrays.bl_idname, text="Sync Radial",
                      icon='FILE_REFRESH')
+
+        col.operator(OBJECT_OT_drop_cable.bl_idname, text="Drop Cable", icon='FORCE_CURVE')
 
         layout.separator()
 
@@ -1885,6 +2021,7 @@ classes = (
     MESH_OT_cursor_to_face,
     OBJECT_OT_snap_to_cursor,
     OBJECT_OT_origin_to_bottom,
+    OBJECT_OT_drop_cable,
     OBJECT_OT_radial_array,
     OBJECT_OT_linear_array,
     OBJECT_OT_sync_radial_arrays,
