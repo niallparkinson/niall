@@ -568,42 +568,52 @@ def pivot_rotation_matrix(pivot, axis, angle):
             @ Matrix.Translation(-pivot))
 
 
-def sync_radial_empty(empty):
-    """Rebuild an offset empty from the array count currently on its parent.
+def iter_radial_arrays(scene):
+    """Every (target, modifier, empty) radial array set up in the scene.
 
-    The Array modifier applies inverse(object) @ offset_object once per copy, so
-    the empty has to hold R @ object_matrix, where R rotates about the pivot
-    line. Placing the empty at the pivot with a bare rotation only produces a
-    ring when the object's origin already sits on the pivot; anywhere else it
-    smears the copies across different radii.
+    Driven from the target rather than the empty: the modifier already holds the
+    only link that matters, so nothing depends on parenting or on names.
     """
-    target = empty.parent
-    if target is None:
+    for target in scene.objects:
+        modifier = target.modifiers.get(ARRAY_RADIAL_MOD)
+        if modifier is None or modifier.offset_object is None:
+            continue
+        yield target, modifier, modifier.offset_object
+
+
+def radial_signature(modifier, matrix):
+    """What the empty's placement was computed from, for change detection."""
+    return [float(modifier.count)] + [round(value, 6) for row in matrix for value in row]
+
+
+def sync_radial_array(target, modifier, empty):
+    """Place the offset empty so the array sweeps a ring about the stored pivot.
+
+    The Array modifier consumes inverse(target) @ empty, so the empty must hold
+    R @ target_matrix, where R rotates about the pivot line. The conjugation by
+    the target matrix is what puts the ring around the pivot instead of spinning
+    every copy about the target's own origin.
+
+    The empty is deliberately left unparented. Parented, its world matrix is
+    derived through the parent's evaluated matrix, and writing either
+    matrix_world or matrix_basis then depends on depsgraph state that is still
+    in flight while the redo panel re-runs the operator. Unparented, the world
+    matrix is the basis, and the placement is exact whenever it is written.
+    """
+    if "array_pivot" not in empty or "array_axis" not in empty:
         return False
 
-    modifier = target.modifiers.get(ARRAY_RADIAL_MOD)
-    if modifier is None or "array_pivot" not in empty or "array_axis" not in empty:
-        return False
-
-    matrix = target.matrix_world
-    # Pivot and axis are stored in the target's local space so the ring follows
-    # the object when it is moved, rotated or scaled.
+    matrix = target.matrix_world.copy()
+    # Pivot and axis are held in the target's local space, so the ring keeps its
+    # place on the model when the model is moved, rotated or scaled.
     pivot = matrix @ Vector(empty["array_pivot"][:])
-    axis = (matrix.to_3x3() @ Vector(empty["array_axis"][:]))
+    axis = matrix.to_3x3() @ Vector(empty["array_axis"][:])
     if axis.length < 1e-9:
         return False
 
     angle = 2.0 * math.pi / max(modifier.count, 1)
-    rotation = pivot_rotation_matrix(pivot, axis.normalized(), angle)
-
-    # Write matrix_basis, not matrix_world. Assigning matrix_world makes Blender
-    # back-solve the basis through the parent's *evaluated* matrix, which is
-    # mid-flight while the redo panel is re-running the operator, so the empty
-    # picked up a basis derived from a stale parent. With the parent inverse
-    # held at identity, basis is exactly the offset the modifier consumes and
-    # depends on nothing the depsgraph has yet to catch up on.
-    empty.matrix_basis = matrix.inverted_safe() @ rotation @ matrix
-    empty["array_count"] = modifier.count
+    empty.matrix_world = pivot_rotation_matrix(pivot, axis.normalized(), angle) @ matrix
+    empty["array_sig"] = radial_signature(modifier, matrix)
     return True
 
 
@@ -620,31 +630,22 @@ def suspended_array_sync():
 
 @bpy.app.handlers.persistent
 def sync_radial_arrays_on_update(scene, depsgraph=None):
-    """Re-space radial arrays when the count is changed outside this addon.
+    """Keep every ring correct as the count changes or the target moves.
 
-    The Array modifier's count is a plain property with no update callback, so
-    editing it in the modifier stack leaves the empty holding the angle for the
-    old count. The extra copies then wrap past 360 degrees and stack back onto
-    the ones already there.
-
-    Object movement needs no handler: the empty is parented to the target, so
-    the relative transform the modifier reads is unchanged by moving it.
-
-    Writing here re-triggers the handler, so the stored count gates the write.
-    The second pass finds nothing to do and stops.
+    The modifier's count has no update callback, and with the empty unparented
+    nothing carries the target's movement across either, so both are watched
+    here. Writing re-triggers the handler, so the stored signature gates the
+    write and the second pass finds nothing to do.
     """
-    collection = bpy.data.collections.get(ARRAY_COLLECTION)
-    if _array_sync_suspended or collection is None:
+    if _array_sync_suspended:
         return
 
-    for empty in collection.objects:
-        target = empty.parent
-        if target is None:
+    for target, modifier, empty in iter_radial_arrays(scene):
+        stored = empty.get("array_sig")
+        if stored is not None and list(stored[:]) == radial_signature(modifier,
+                                                                     target.matrix_world):
             continue
-        modifier = target.modifiers.get(ARRAY_RADIAL_MOD)
-        if modifier is None or empty.get("array_count") == modifier.count:
-            continue
-        sync_radial_empty(empty)
+        sync_radial_array(target, modifier, empty)
 
 
 def resolve_array_axis(context, mode):
@@ -914,15 +915,12 @@ class OBJECT_OT_radial_array(bpy.types.Operator):
         empty["array_pivot"] = tuple(inverse @ context.scene.cursor.location)
         empty["array_axis"] = tuple((inverse.to_3x3() @ axis).normalized())
 
-        # Parenting keeps the relative transform fixed, so moving or rotating the
-        # object carries the whole ring with it instead of tearing it apart. The
-        # parent inverse stays at identity so the empty's basis is exactly the
-        # offset the modifier reads, with no evaluated parent state in the way.
-        empty.parent = target
-        empty.matrix_parent_inverse = Matrix.Identity(4)
+        # Never parented: see sync_radial_array. Movement of the target is
+        # picked up by the depsgraph handler instead.
+        empty.parent = None
 
         with suspended_array_sync():
-            sync_radial_empty(empty)
+            sync_radial_array(target, modifier, empty)
         stash_in_collection(context, empty,
                             get_helper_collection(context, ARRAY_COLLECTION, hide_on_create=True))
         sort_post_boolean_stack(target)
@@ -1005,13 +1003,13 @@ class OBJECT_OT_sync_radial_arrays(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return bpy.data.collections.get(ARRAY_COLLECTION) is not None
+        return any(True for _ in iter_radial_arrays(context.scene))
 
     def execute(self, context):
-        collection = bpy.data.collections.get(ARRAY_COLLECTION)
-        # The redo panel keeps count and spacing in step while it is open. This
-        # is for afterwards, when the count is changed in the modifier stack.
-        synced = sum(1 for empty in collection.objects if sync_radial_empty(empty))
+        # The handler keeps these in step already; this is a manual repair for
+        # anything that has drifted, such as a hand-edited empty.
+        synced = sum(1 for entry in iter_radial_arrays(context.scene)
+                     if sync_radial_array(*entry))
         if not synced:
             self.report({'WARNING'}, "No radial arrays to sync.")
             return {'CANCELLED'}
