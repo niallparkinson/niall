@@ -339,6 +339,79 @@ def face_alignment_matrix(obj, faces, active_face):
     return Matrix.Translation(centre) @ basis
 
 
+def is_smart_bevel(modifier):
+    """Only modifiers this addon created.
+
+    Type is checked alongside the name so a hand-built modifier that merely
+    starts with the same word is never touched, and startswith covers the
+    Smart_Bevel.001 Blender produces on some duplications.
+    """
+    return modifier.type == 'BEVEL' and modifier.name.startswith(BEVEL_MOD)
+
+
+def iter_smart_bevels(scene, view_layer, selected_only):
+    """Every Smart Bevel in the scene, or only on the selected objects.
+
+    Scoped to scene.objects rather than bpy.data.objects: the latter also holds
+    objects belonging to other scenes and orphaned data, which are not what
+    "the whole scene" means to someone dragging the slider.
+    """
+    objects = view_layer.objects.selected if selected_only else scene.objects
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        for modifier in obj.modifiers:
+            if is_smart_bevel(modifier):
+                yield modifier
+
+
+@contextmanager
+def bevels_at_render_visibility(objects):
+    """Restore muted Smart Bevels for the duration of an export.
+
+    The exporter reads the viewport depsgraph, so a bevel muted for viewport
+    performance would otherwise export as an unbevelled mesh: exactly the
+    silent failure the mute toggle promises not to cause. Each bevel is forced
+    to its own render visibility, then put back.
+    """
+    changed = []
+    for obj in objects:
+        for modifier in obj.modifiers:
+            if is_smart_bevel(modifier) and modifier.show_viewport != modifier.show_render:
+                changed.append((modifier, modifier.show_viewport))
+                modifier.show_viewport = modifier.show_render
+
+    if changed:
+        bpy.context.view_layer.update()
+    try:
+        yield
+    finally:
+        for modifier, previous in changed:
+            modifier.show_viewport = previous
+
+
+def apply_bevel_resolution(scene, view_layer):
+    """Push the scene's bevel settings onto every targeted Smart Bevel."""
+    count = 0
+    for modifier in iter_smart_bevels(scene, view_layer, scene.smart_bevel_selected_only):
+        modifier.segments = scene.smart_bevel_segments
+        if scene.smart_bevel_override_width:
+            modifier.width = scene.smart_bevel_width
+        count += 1
+    return count
+
+
+def _update_bevel_resolution(self, context):
+    apply_bevel_resolution(self, context.view_layer)
+
+
+def _update_bevel_mute(self, context):
+    for modifier in iter_smart_bevels(self, context.view_layer, self.smart_bevel_selected_only):
+        # Viewport only. show_render is never touched, so the export path and
+        # any Blender render still see the bevels.
+        modifier.show_viewport = not self.smart_bevel_mute
+
+
 def sanitize_filename(name):
     cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
     return cleaned or "Mesh"
@@ -840,6 +913,29 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
         sort_post_boolean_stack(obj)
 
 
+class OBJECT_OT_apply_bevel_resolution(bpy.types.Operator):
+    """Push the current bevel resolution onto every targeted Smart Bevel"""
+    bl_idname = "object.apply_bevel_resolution"
+    bl_label = "Apply Resolution"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT'
+
+    def execute(self, context):
+        # The slider updates live as it is dragged, so this is for after the
+        # selection changes or new objects arrive without the slider moving.
+        count = apply_bevel_resolution(context.scene, context.view_layer)
+        if not count:
+            self.report({'WARNING'}, "No Smart Bevel modifiers in range.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Set {count} Smart Bevel(s) to "
+                              f"{context.scene.smart_bevel_segments} segment(s).")
+        return {'FINISHED'}
+
+
 # --- UV -----------------------------------------------------------------------
 
 class OBJECT_OT_smart_uv(bpy.types.Operator):
@@ -967,12 +1063,13 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
         are real geometry before the UVs are generated, and lets rotation and
         scale be baked in so the FBX carries a clean transform.
         """
-        depsgraph = context.evaluated_depsgraph_get()
-        mesh = bpy.data.meshes.new_from_object(
-            source.evaluated_get(depsgraph),
-            preserve_all_data_layers=True,
-            depsgraph=depsgraph,
-        )
+        with bevels_at_render_visibility((source,)):
+            depsgraph = context.evaluated_depsgraph_get()
+            mesh = bpy.data.meshes.new_from_object(
+                source.evaluated_get(depsgraph),
+                preserve_all_data_layers=True,
+                depsgraph=depsgraph,
+            )
         mesh.name = name
 
         temp = bpy.data.objects.new(name, mesh)
@@ -1064,6 +1161,8 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.scale_y = 1.5
         row.operator(OBJECT_OT_smart_bevel.bl_idname, text="Smart Bevel")
 
+        self.draw_bevel_resolution(context, layout)
+
         layout.separator()
 
         layout.label(text="UV & Prep:", icon='UV')
@@ -1102,6 +1201,45 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="Low Poly").export_type = 'LOW'
 
     @staticmethod
+    def draw_bevel_resolution(context, layout):
+        scene = context.scene
+        box = layout.box()
+
+        row = box.row(align=True)
+        row.prop(scene, "smart_bevel_segments")
+        row.prop(
+            scene, "smart_bevel_mute", text="",
+            icon='HIDE_ON' if scene.smart_bevel_mute else 'HIDE_OFF', toggle=True,
+        )
+
+        box.prop(scene, "smart_bevel_selected_only")
+        box.prop(scene, "smart_bevel_override_width")
+        if scene.smart_bevel_override_width:
+            box.prop(scene, "smart_bevel_width")
+
+        box.operator(OBJECT_OT_apply_bevel_resolution.bl_idname, icon='FILE_REFRESH')
+
+        # Report what the bevels actually are, not what the slider was last set
+        # to. The two diverge as soon as anything is bevelled outside the slider.
+        low = high = None
+        count = 0
+        for modifier in iter_smart_bevels(scene, context.view_layer,
+                                          scene.smart_bevel_selected_only):
+            count += 1
+            segments = modifier.segments
+            low = segments if low is None else min(low, segments)
+            high = segments if high is None else max(high, segments)
+
+        info = box.row()
+        if not count:
+            info.enabled = False
+            info.label(text="No Smart Bevels in range")
+        else:
+            span = f"{low}" if low == high else f"{low}-{high}"
+            info.label(text=f"{count} bevel(s) at {span} segments",
+                       icon='CHECKMARK' if low == high else 'INFO')
+
+    @staticmethod
     def draw_cutter_toggle(context, layout):
         layer_coll = get_cutter_layer_collection(context)
         collection = bpy.data.collections.get(CUTTER_COLLECTION)
@@ -1137,6 +1275,7 @@ classes = (
     OBJECT_OT_smart_slice,
     OBJECT_OT_smart_union,
     OBJECT_OT_smart_bevel,
+    OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
     OBJECT_OT_smart_export_ue5,
     VIEW3D_PT_smart_tools,
@@ -1144,6 +1283,43 @@ classes = (
 
 
 SCENE_PROPS = {
+    "smart_bevel_segments": IntProperty(
+        name="Segments",
+        description="Segment count pushed onto every Smart Bevel in range. Drag "
+                    "to change the whole scene's edge resolution live",
+        default=3, min=1, max=12,
+        update=_update_bevel_resolution,
+    ),
+    "smart_bevel_selected_only": BoolProperty(
+        name="Selected Objects Only",
+        description="Limit the slider and mute toggle to the current selection "
+                    "instead of the whole scene",
+        default=False,
+        # Deliberately no update callback: flipping the scope should not by
+        # itself rewrite every bevel in the scene. It takes effect on the next
+        # slider drag or Apply Resolution click.
+    ),
+    "smart_bevel_mute": BoolProperty(
+        name="Mute Bevels in Viewport",
+        description="Disable Smart Bevels in the viewport for framerate. Render "
+                    "and export visibility are untouched",
+        default=False,
+        update=_update_bevel_mute,
+    ),
+    "smart_bevel_override_width": BoolProperty(
+        name="Override Width",
+        description="Also force one width on every Smart Bevel. Off by default: "
+                    "the right width depends on each object's scale, so a global "
+                    "value flattens that judgement across the whole scene",
+        default=False,
+        update=_update_bevel_resolution,
+    ),
+    "smart_bevel_width": FloatProperty(
+        name="Width",
+        default=0.01, min=0.0001, max=1.0, precision=4, step=0.01,
+        subtype='DISTANCE',
+        update=_update_bevel_resolution,
+    ),
     "smart_export_path": StringProperty(
         name="Export Directory",
         description="Choose a directory to export the FBX files",
