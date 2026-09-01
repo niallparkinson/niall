@@ -18,11 +18,33 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from mathutils import Matrix, Vector
 
 CUTTER_COLLECTION = "Cutters_Collection"
+WELD_MOD = "Smart_Weld"
 BEVEL_MOD = "Smart_Bevel"
 WEIGHTED_NORMAL_MOD = "Smart_Weighted_Normal"
-SHADING_MOD_TYPES = {'BEVEL', 'WEIGHTED_NORMAL'}
+
+# Modifiers that must always evaluate after every boolean, in this order.
+POST_BOOLEAN_STACK = (WELD_MOD, BEVEL_MOD, WEIGHTED_NORMAL_MOD)
+POST_BOOLEAN_TYPES = {'WELD', 'BEVEL', 'WEIGHTED_NORMAL'}
+
 INVALID_FILENAME_CHARS = set('\\/:*?"<>|')
 DUPLICATE_SUFFIX = re.compile(r"\.\d{3}$")
+
+
+def _boolean_solver_items():
+    """Read the solver list off the Boolean modifier's RNA.
+
+    Built from RNA rather than hardcoded so the addon picks up whatever solvers
+    the running Blender actually ships (4.5+ adds Manifold alongside Fast and
+    Exact) without a version check.
+    """
+    try:
+        rna = bpy.types.BooleanModifier.bl_rna.properties["solver"]
+        return [(item.identifier, item.name, item.description) for item in rna.enum_items]
+    except Exception:
+        return [('FAST', "Fast", "Simple solver"), ('EXACT', "Exact", "Robust solver")]
+
+
+BOOLEAN_SOLVERS = _boolean_solver_items()
 
 
 # --- HELPERS -----------------------------------------------------------------
@@ -74,36 +96,78 @@ def get_cutter_collection(context):
     return coll
 
 
-def stash_cutter(context, cutter):
-    """Move a cutter into the hidden cutter collection and set it to wireframe."""
+def stash_operand(context, operand):
+    """Hide a boolean operand in the cutter collection and set it to wireframe.
+
+    Union operands are not cutters, but they need identical treatment, so they
+    share the one collection rather than proliferating bookkeeping.
+    """
     coll = get_cutter_collection(context)
-    if cutter.name not in coll.objects:
-        coll.objects.link(cutter)
+    if operand.name not in coll.objects:
+        coll.objects.link(operand)
     # users_collection is a tuple snapshot, so unlinking while iterating is safe.
-    for other in cutter.users_collection:
+    for other in operand.users_collection:
         if other is not coll:
-            other.objects.unlink(cutter)
-    cutter.display_type = 'WIRE'
-    cutter.hide_render = True
+            other.objects.unlink(operand)
+    operand.display_type = 'WIRE'
+    operand.hide_render = True
 
 
-def add_boolean(target, cutter, operation, name):
-    """Add a boolean modifier ahead of any bevel/weighted-normal modifiers.
+def add_boolean(target, operand, operation, name, options=None):
+    """Add a boolean modifier ahead of the weld/bevel/weighted-normal stack.
 
     Booleans appended after the shading stack produce exactly the normal
     artifacts the bevel setup exists to avoid, so new cuts are moved in front
-    of the first shading modifier.
+    of the first post-boolean modifier.
     """
     mod = target.modifiers.new(name=name, type='BOOLEAN')
     mod.operation = operation
-    mod.object = cutter
-    mod.solver = 'EXACT'
+    mod.object = operand
+    mod.solver = options.solver if options else 'EXACT'
+
+    if options:
+        # Exact-solver only; harmless on other solvers, absent on old builds.
+        if hasattr(mod, "use_hole_tolerant"):
+            mod.use_hole_tolerant = options.hole_tolerant
+        if hasattr(mod, "use_self"):
+            mod.use_self = options.self_intersection
+        # Fast-solver coplanar tolerance.
+        if hasattr(mod, "double_threshold"):
+            mod.double_threshold = options.overlap_threshold
 
     for index, existing in enumerate(target.modifiers):
-        if existing is not mod and existing.type in SHADING_MOD_TYPES:
+        if existing is not mod and existing.type in POST_BOOLEAN_TYPES:
             target.modifiers.move(len(target.modifiers) - 1, index)
             break
     return mod
+
+
+def ensure_weld(obj, merge_distance, connected_only=True):
+    """Add or update the seam-welding modifier.
+
+    The brief asks for Merge by Distance after the union, but the union is an
+    unapplied modifier, so there is no result mesh in Object Mode to weld. A
+    Weld modifier is the non-destructive equivalent and keeps the whole stack
+    live. Connected mode only merges vertices that already share an edge, so it
+    cleans boolean slivers without collapsing unrelated nearby surfaces.
+    """
+    weld = obj.modifiers.get(WELD_MOD) or obj.modifiers.new(name=WELD_MOD, type='WELD')
+    weld.merge_threshold = merge_distance
+    if hasattr(weld, "mode"):
+        weld.mode = 'CONNECTED' if connected_only else 'ALL'
+    return weld
+
+
+def sort_post_boolean_stack(obj):
+    """Force weld -> bevel -> weighted normal to the tail of the stack, in order.
+
+    Moving each to the end in sequence leaves them correctly ordered relative to
+    one another and after every boolean, whatever order they were created in.
+    """
+    for name in POST_BOOLEAN_STACK:
+        index = obj.modifiers.find(name)
+        if index != -1:
+            obj.modifiers.move(index, len(obj.modifiers) - 1)
 
 
 def auto_unwrap(context, obj, angle_limit, island_margin, clear_seams):
@@ -125,6 +189,43 @@ def auto_unwrap(context, obj, angle_limit, island_margin, clear_seams):
         bpy.ops.object.mode_set(mode='OBJECT')
 
 
+def clean_mesh(context, obj, merge_distance, remove_interior):
+    """Weld, strip interior faces and loose geometry, and fix normals.
+
+    This runs on the evaluated export copy rather than the live object because
+    the booleans are unapplied modifiers: interior faces of a union do not exist
+    as editable geometry until the stack has been evaluated. A correct Exact or
+    Manifold union already discards the interior, so on a clean merge the
+    interior pass finds nothing; it earns its place on coplanar overlaps and on
+    operands that were not watertight to begin with.
+    """
+    removed_faces = len(obj.data.polygons)
+    removed_verts = len(obj.data.vertices)
+
+    with sole_active(context, obj):
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.remove_doubles(threshold=merge_distance)
+
+        if remove_interior:
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.mesh.select_mode(type='FACE')
+            bpy.ops.mesh.select_interior_faces()
+            bpy.ops.mesh.delete(type='FACE')
+
+        # Vertices and edges attached to no face at all.
+        bpy.ops.mesh.select_mode(type='VERT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.mesh.select_loose()
+        bpy.ops.mesh.delete(type='VERT')
+
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    return removed_verts - len(obj.data.vertices), removed_faces - len(obj.data.polygons)
+
+
 def sanitize_filename(name):
     cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
     return cleaned or "Mesh"
@@ -136,7 +237,53 @@ def selected_meshes(context):
 
 # --- BOOLEAN & CUTTER OPERATORS ----------------------------------------------
 
-class OBJECT_OT_smart_difference(bpy.types.Operator):
+class SmartBooleanOptions:
+    """Solver settings shared by every boolean operator.
+
+    Annotations on a plain mixin are picked up by register_class, the same way
+    bpy_extras.io_utils.ExportHelper supplies filepath to exporters.
+    """
+
+    solver: EnumProperty(
+        name="Solver",
+        description="Exact handles coplanar faces correctly; Fast is the escape "
+                    "hatch for dense meshes where Exact hangs",
+        items=BOOLEAN_SOLVERS,
+        default='EXACT',
+    )
+    hole_tolerant: BoolProperty(
+        name="Hole Tolerant",
+        description="Let the Exact solver cope with operands that are not fully "
+                    "watertight",
+        default=False,
+    )
+    self_intersection: BoolProperty(
+        name="Self Intersection",
+        description="Correctly handle operands whose own geometry overlaps itself",
+        default=False,
+    )
+    overlap_threshold: FloatProperty(
+        name="Overlap Threshold",
+        description="Coplanar tolerance used by the Fast solver",
+        default=1e-6, min=0.0, max=1.0, precision=6, step=0.001,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "solver")
+        if self.solver == 'FAST':
+            layout.prop(self, "overlap_threshold")
+        else:
+            layout.prop(self, "hole_tolerant")
+            layout.prop(self, "self_intersection")
+        self.draw_extra(layout)
+
+    def draw_extra(self, layout):
+        """Hook for operators with options beyond the shared solver settings."""
+
+
+class OBJECT_OT_smart_difference(SmartBooleanOptions, bpy.types.Operator):
     """Apply Smart Difference Boolean and organize cutter"""
     bl_idname = "object.smart_difference"
     bl_label = "Smart Difference"
@@ -156,14 +303,14 @@ class OBJECT_OT_smart_difference(bpy.types.Operator):
             return {'CANCELLED'}
 
         for cutter in cutters:
-            add_boolean(target, cutter, 'DIFFERENCE', f"Bool_Diff_{cutter.name}")
-            stash_cutter(context, cutter)
+            add_boolean(target, cutter, 'DIFFERENCE', f"Bool_Diff_{cutter.name}", self)
+            stash_operand(context, cutter)
 
         self.report({'INFO'}, f"Applied {len(cutters)} smart booleans.")
         return {'FINISHED'}
 
 
-class OBJECT_OT_smart_slice(bpy.types.Operator):
+class OBJECT_OT_smart_slice(SmartBooleanOptions, bpy.types.Operator):
     """Cut and detach a piece from the target object"""
     bl_idname = "object.smart_slice"
     bl_label = "Smart Slice"
@@ -191,13 +338,78 @@ class OBJECT_OT_smart_slice(bpy.types.Operator):
             slice_obj.name = f"{target.name}_Slice"
             for coll in target.users_collection:
                 coll.objects.link(slice_obj)
-            add_boolean(slice_obj, cutter, 'INTERSECT', f"Bool_Slice_{cutter.name}")
+            add_boolean(slice_obj, cutter, 'INTERSECT', f"Bool_Slice_{cutter.name}", self)
 
         for cutter in cutters:
-            add_boolean(target, cutter, 'DIFFERENCE', f"Bool_Diff_{cutter.name}")
-            stash_cutter(context, cutter)
+            add_boolean(target, cutter, 'DIFFERENCE', f"Bool_Diff_{cutter.name}", self)
+            stash_operand(context, cutter)
 
         self.report({'INFO'}, f"Sliced {len(cutters)} pieces from {target.name}.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_smart_union(SmartBooleanOptions, bpy.types.Operator):
+    """Merge shapes into the active object and clean up the new seam"""
+    bl_idname = "object.smart_union"
+    bl_label = "Smart Union"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    weld_seams: BoolProperty(
+        name="Weld Seams",
+        description="Add a Weld modifier after the union so rogue vertices along "
+                    "the intersection cannot break the Smart Bevel",
+        default=True,
+    )
+    weld_distance: FloatProperty(
+        name="Weld Distance",
+        description="Merge distance for the seam weld. Keep this well below your "
+                    "smallest intended detail",
+        default=0.0001, min=0.0, max=0.1, precision=5, step=0.001,
+        subtype='DISTANCE',
+    )
+    weld_connected_only: BoolProperty(
+        name="Connected Only",
+        description="Only merge vertices that already share an edge. Turn off to "
+                    "merge every vertex pair within the distance, which is more "
+                    "thorough and more destructive",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and context.active_object is not None
+                and context.active_object.type == 'MESH'
+                and len(context.selected_objects) >= 2)
+
+    def draw_extra(self, layout):
+        layout.separator()
+        layout.prop(self, "weld_seams")
+        if self.weld_seams:
+            layout.prop(self, "weld_distance")
+            layout.prop(self, "weld_connected_only")
+
+    def execute(self, context):
+        target = context.active_object
+        operands = [obj for obj in context.selected_objects
+                    if obj is not target and obj.type == 'MESH']
+        if not operands:
+            self.report({'ERROR'}, "Select at least one mesh to merge into the active object.")
+            return {'CANCELLED'}
+
+        for operand in operands:
+            add_boolean(target, operand, 'UNION', f"Bool_Union_{operand.name}", self)
+            stash_operand(context, operand)
+
+        if self.weld_seams:
+            ensure_weld(target, self.weld_distance, self.weld_connected_only)
+
+        # Union must evaluate before the bevel so the new seam is bevelled with
+        # everything else, and before the weighted normal so the seam shades
+        # like the rest of the surface.
+        sort_post_boolean_stack(target)
+
+        self.report({'INFO'}, f"Merged {len(operands)} object(s) into {target.name}.")
         return {'FINISHED'}
 
 
@@ -269,10 +481,9 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
                            or obj.modifiers.new(name=WEIGHTED_NORMAL_MOD, type='WEIGHTED_NORMAL'))
         weighted_normal.keep_sharp = True
 
-        # Weighted Normal only reads correct data if it evaluates last.
-        last = len(obj.modifiers) - 1
-        if obj.modifiers.find(WEIGHTED_NORMAL_MOD) != last:
-            obj.modifiers.move(obj.modifiers.find(WEIGHTED_NORMAL_MOD), last)
+        # Keeps weld -> bevel -> weighted normal in order at the tail, after
+        # every boolean, however the user built the stack up.
+        sort_post_boolean_stack(obj)
 
 
 # --- UV -----------------------------------------------------------------------
@@ -353,10 +564,20 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
             return {'CANCELLED'}
 
         written = 0
+        cleaned_verts = 0
+        cleaned_faces = 0
         for source in sources:
             name = self.asset_name(source.name)
             temp = self.build_export_copy(context, source, name, scene.smart_export_origin)
             try:
+                # Clean before unwrapping: the UVs must describe the final mesh.
+                if scene.smart_export_clean:
+                    verts, faces = clean_mesh(context, temp,
+                                              scene.smart_export_merge_distance,
+                                              scene.smart_export_remove_interior)
+                    cleaned_verts += verts
+                    cleaned_faces += faces
+
                 # High poly is a bake source only, so it never needs UVs.
                 if self.export_type == 'LOW' and scene.smart_export_unwrap:
                     auto_unwrap(context, temp, scene.smart_export_seam_angle,
@@ -368,7 +589,10 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                 bpy.data.objects.remove(temp, do_unlink=True)
                 bpy.data.meshes.remove(mesh)
 
-        self.report({'INFO'}, f"Exported {written} FBX file(s) to {export_dir}")
+        summary = f"Exported {written} FBX file(s) to {export_dir}"
+        if cleaned_verts or cleaned_faces:
+            summary += f" (removed {cleaned_verts} vertices, {cleaned_faces} faces)"
+        self.report({'INFO'}, summary)
         return {'FINISHED'}
 
     def asset_name(self, raw_name):
@@ -463,10 +687,12 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         layout = self.layout
 
         layout.label(text="Booleans:", icon='MOD_BOOLEAN')
-        row = layout.row(align=True)
-        row.scale_y = 1.5
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        row = col.row(align=True)
         row.operator(OBJECT_OT_smart_difference.bl_idname, text="Difference")
         row.operator(OBJECT_OT_smart_slice.bl_idname, text="Slice")
+        col.operator(OBJECT_OT_smart_union.bl_idname, text="Union")
 
         layout.separator()
 
@@ -493,6 +719,13 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         scene = context.scene
         layout.prop(scene, "smart_export_path", text="")
         layout.prop(scene, "smart_export_origin", text="Origin")
+
+        layout.prop(scene, "smart_export_clean")
+        if scene.smart_export_clean:
+            col = layout.column(align=True)
+            col.prop(scene, "smart_export_merge_distance")
+            col.prop(scene, "smart_export_remove_interior")
+
         layout.prop(scene, "smart_export_unwrap")
 
         if scene.smart_export_unwrap:
@@ -509,6 +742,7 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
 classes = (
     OBJECT_OT_smart_difference,
     OBJECT_OT_smart_slice,
+    OBJECT_OT_smart_union,
     OBJECT_OT_smart_bevel,
     OBJECT_OT_smart_uv,
     OBJECT_OT_smart_export_ue5,
@@ -531,6 +765,24 @@ SCENE_PROPS = {
             ('BOTTOM', "Bounds Bottom", "Recentre on the bounding box, origin at bottom centre"),
         ],
         default='KEEP',
+    ),
+    "smart_export_clean": BoolProperty(
+        name="Clean Mesh",
+        description="Weld, strip interior faces and loose geometry, and recalculate "
+                    "normals on the evaluated mesh before it is written",
+        default=True,
+    ),
+    "smart_export_merge_distance": FloatProperty(
+        name="Merge Distance",
+        description="Merge by Distance threshold applied to the evaluated mesh",
+        default=0.0001, min=0.0, max=0.1, precision=5, step=0.001,
+        subtype='DISTANCE',
+    ),
+    "smart_export_remove_interior": BoolProperty(
+        name="Remove Interior Faces",
+        description="Delete faces buried inside the solid, which a union over "
+                    "coplanar or non-watertight operands can leave behind",
+        default=True,
     ),
     "smart_export_unwrap": BoolProperty(
         name="Unwrap Low Poly",
