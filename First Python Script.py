@@ -591,7 +591,37 @@ def sync_radial_empty(empty):
 
     angle = 2.0 * math.pi / max(modifier.count, 1)
     empty.matrix_world = pivot_rotation_matrix(pivot, axis.normalized(), angle) @ matrix
+    empty["array_count"] = modifier.count
     return True
+
+
+@bpy.app.handlers.persistent
+def sync_radial_arrays_on_update(scene, depsgraph=None):
+    """Re-space radial arrays when the count is changed outside this addon.
+
+    The Array modifier's count is a plain property with no update callback, so
+    editing it in the modifier stack leaves the empty holding the angle for the
+    old count. The extra copies then wrap past 360 degrees and stack back onto
+    the ones already there.
+
+    Object movement needs no handler: the empty is parented to the target, so
+    the relative transform the modifier reads is unchanged by moving it.
+
+    Writing here re-triggers the handler, so the stored count gates the write.
+    The second pass finds nothing to do and stops.
+    """
+    collection = bpy.data.collections.get(ARRAY_COLLECTION)
+    if collection is None:
+        return
+
+    for empty in collection.objects:
+        target = empty.parent
+        if target is None:
+            continue
+        modifier = target.modifiers.get(ARRAY_RADIAL_MOD)
+        if modifier is None or empty.get("array_count") == modifier.count:
+            continue
+        sync_radial_empty(empty)
 
 
 def resolve_array_axis(context, mode):
@@ -1946,8 +1976,14 @@ def register():
 
     register_keymaps()
 
+    if sync_radial_arrays_on_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(sync_radial_arrays_on_update)
+
 
 def unregister():
+    if sync_radial_arrays_on_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(sync_radial_arrays_on_update)
+
     unregister_keymaps()
 
     # Classes come off first: the panel's draw() reads these scene properties.
