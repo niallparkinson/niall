@@ -581,43 +581,40 @@ def iter_radial_arrays(scene):
         yield target, modifier, modifier.offset_object
 
 
-def radial_signature(modifier):
-    """What the empty's placement was computed from, for change detection.
-
-    Only the count: the placement is world space and holds no reference to the
-    target, so moving the object needs no resync.
-    """
-    return [float(modifier.count)]
+def radial_signature(modifier, matrix):
+    """What the empty's placement was computed from, for change detection."""
+    return [float(modifier.count)] + [round(value, 6) for row in matrix for value in row]
 
 
 def sync_radial_array(target, modifier, empty):
     """Place the offset empty so the array sweeps a ring about the stored pivot.
 
-    The Array modifier builds its per-copy step as
+    The Array modifier builds its per-copy step as inverse(target) @ empty, so
+    the empty must hold R @ target_matrix, where R rotates about the pivot line.
+    The step is then inverse(M) @ R @ M, whose i-th power is inverse(M) @ R^i @ M,
+    placing copy i at R^i applied to the object's world geometry.
 
-        inverse(target) @ empty @ target
+    Dropping the target matrix and storing R alone leaves the step as
+    inverse(M) @ R, which is not a rotation at all: it compounds the object's own
+    transform once per copy, so the copies spiral outwards and grow. Verified
+    against Blender rather than derived: E = R @ M holds a ring, E = R does not.
 
-    so the empty's world matrix is applied to each copy's *world* position. It
-    therefore has to be the world-space step itself: the rotation about the
-    pivot line, and nothing more. Composing it with the target's matrix adds a
-    second copy of that transform per step, which walks the copies outwards in a
-    spiral instead of around a ring.
-
-    Because the step is pure world space, the empty is independent of the
-    target: moving the object slides it around the same fixed pivot, which is
-    what pinning the pivot to the 3D cursor should mean.
+    Pivot and axis are held in world space: the pivot belongs to the 3D cursor,
+    not to the object, so moving the object changes the ring's radius and leaves
+    its centre where it was put.
     """
     if "array_pivot" not in empty or "array_axis" not in empty:
         return False
 
+    matrix = target.matrix_world.copy()
+    pivot = Vector(empty["array_pivot"][:])
     axis = Vector(empty["array_axis"][:])
     if axis.length < 1e-9:
         return False
 
     angle = 2.0 * math.pi / max(modifier.count, 1)
-    empty.matrix_world = pivot_rotation_matrix(
-        Vector(empty["array_pivot"][:]), axis.normalized(), angle)
-    empty["array_sig"] = radial_signature(modifier)
+    empty.matrix_world = pivot_rotation_matrix(pivot, axis.normalized(), angle) @ matrix
+    empty["array_sig"] = radial_signature(modifier, matrix)
     return True
 
 
@@ -636,16 +633,18 @@ def suspended_array_sync():
 def sync_radial_arrays_on_update(scene, depsgraph=None):
     """Keep every ring correct as the count changes or the target moves.
 
-    The modifier's count has no update callback, so nothing else notices when it
-    changes. Writing re-triggers the handler, so the stored count gates the
-    write and the second pass finds nothing to do.
+    The modifier's count has no update callback, and the empty's placement
+    depends on the target's matrix, so both are watched. Writing re-triggers the
+    handler, so the stored signature gates the write and the second pass finds
+    nothing to do.
     """
     if _array_sync_suspended:
         return
 
     for target, modifier, empty in iter_radial_arrays(scene):
         stored = empty.get("array_sig")
-        if stored is not None and list(stored[:]) == radial_signature(modifier):
+        if stored is not None and list(stored[:]) == radial_signature(modifier,
+                                                                     target.matrix_world):
             continue
         sync_radial_array(target, modifier, empty)
 
@@ -874,6 +873,12 @@ class OBJECT_OT_radial_array(bpy.types.Operator):
         name="Count", description="Copies around the full circle",
         default=6, min=2, max=256,
     )
+    radius_offset: FloatProperty(
+        name="Radius Offset",
+        description="Slide the object toward or away from the pivot before "
+                    "arraying, to dial the ring's radius without moving it by hand",
+        default=0.0, precision=4, step=1.0, subtype='DISTANCE',
+    )
     axis_mode: EnumProperty(
         name="Axis",
         items=[
@@ -891,12 +896,32 @@ class OBJECT_OT_radial_array(bpy.types.Operator):
     def poll(cls, context):
         return context.mode == 'OBJECT' and context.active_object is not None
 
+    @staticmethod
+    def slide_radially(target, pivot, axis, distance):
+        """Move the object in or out along its radius from the pivot."""
+        direction = target.matrix_world.translation - pivot
+        unit = axis.normalized()
+        direction -= unit * direction.dot(unit)
+        if direction.length < 1e-9:
+            return
+
+        matrix = target.matrix_world.copy()
+        matrix.translation = matrix.translation + direction.normalized() * distance
+        target.matrix_world = matrix
+
     def execute(self, context):
         target = context.active_object
         axis = resolve_array_axis(context, self.axis_mode)
         if axis.length < 1e-9:
             self.report({'ERROR'}, "Could not resolve a rotation axis.")
             return {'CANCELLED'}
+
+        # Applied before anything is measured. A fresh run leaves this at zero,
+        # and a redo re-applies it from the pre-operator position, so dragging
+        # the slider dials the radius instead of accumulating.
+        if self.radius_offset:
+            self.slide_radially(target, context.scene.cursor.location, axis,
+                                self.radius_offset)
 
         modifier = (target.modifiers.get(ARRAY_RADIAL_MOD)
                     or target.modifiers.new(name=ARRAY_RADIAL_MOD, type='ARRAY'))
@@ -913,8 +938,6 @@ class OBJECT_OT_radial_array(bpy.types.Operator):
             context.scene.collection.objects.link(empty)
             modifier.offset_object = empty
 
-        # World space: the modifier applies the empty's transform to world
-        # positions, so the pivot stays put on the cursor whatever the object does.
         empty["array_pivot"] = tuple(context.scene.cursor.location)
         empty["array_axis"] = tuple(axis.normalized())
         empty.parent = None
