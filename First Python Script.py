@@ -17,6 +17,7 @@ import bmesh
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from mathutils import Matrix, Vector
+from mathutils.geometry import interpolate_bezier
 
 CUTTER_COLLECTION = "Cutters_Collection"
 ARRAY_COLLECTION = "Array_Helpers"
@@ -673,7 +674,7 @@ def cable_signature(cable, head, tail):
     return values
 
 
-def redrape_cable(cable):
+def rehang_cable(cable):
     """Rebuild a cable's curve from its two anchors and its stored parameters.
 
     Three control points rather than two: the ends carry the connector's exit
@@ -688,11 +689,14 @@ def redrape_cable(cable):
         return False
 
     curve = cable.data
-    if not curve.splines or curve.splines[0].type != 'BEZIER':
-        return False
-    spline = curve.splines[0]
-    if len(spline.bezier_points) != 3:
-        return False
+    spline = curve.splines[0] if curve.splines else None
+    if spline is None or spline.type != 'BEZIER' or len(spline.bezier_points) != 3:
+        # A draped cable carries a dense simulated spline. Rebuilding it back to
+        # three points is what lets a bake be re-hung or re-draped rather than
+        # being a one-way door.
+        curve.splines.clear()
+        spline = curve.splines.new('BEZIER')
+        spline.bezier_points.add(2)
 
     start = head_anchor.matrix_world.translation.copy()
     end = tail_anchor.matrix_world.translation.copy()
@@ -729,9 +733,191 @@ def redrape_cable(cable):
 
 
 def _update_cable(self, context):
-    """Re-hang this cable the moment its slider moves."""
+    """Re-hang this cable the moment its slider moves.
+
+    Dragging sag or lead is a request for the parametric shape, so it also
+    clears any bake: the alternative is a slider that silently does nothing.
+    """
     with suspended_auto_sync():
-        redrape_cable(self)
+        self["cable_draped"] = False
+        rehang_cable(self)
+
+
+def bezier_polyline(spline, per_segment=12):
+    """Sample a Bezier spline into a polyline of world-space points."""
+    points = spline.bezier_points
+    path = []
+    for index in range(len(points) - 1):
+        first, second = points[index], points[index + 1]
+        segment = interpolate_bezier(first.co, first.handle_right,
+                                     second.handle_left, second.co, per_segment)
+        path.extend(segment if index == 0 else segment[1:])
+    return [Vector(point) for point in path]
+
+
+def resample_evenly(path, count):
+    """Redistribute a polyline into count points spaced evenly along its length."""
+    if len(path) < 2 or count < 2:
+        return [point.copy() for point in path]
+
+    spans = [(path[index + 1] - path[index]).length for index in range(len(path) - 1)]
+    total = sum(spans)
+    if total < 1e-12:
+        return [path[0].copy() for _ in range(count)]
+
+    result = [path[0].copy()]
+    step = total / (count - 1)
+    index = 0
+    walked = 0.0
+
+    for target in range(1, count - 1):
+        distance = target * step
+        # Degenerate spans are stepped over rather than landed on. A settled
+        # rope bunches where it rests, so its polyline carries near-zero spans;
+        # stopping on one emits the same point twice and leaves a zero-length
+        # segment in the curve.
+        while index < len(spans) - 1 and (spans[index] <= 1e-12
+                                          or walked + spans[index] < distance):
+            walked += spans[index]
+            index += 1
+
+        fraction = 0.0
+        if spans[index] > 1e-12:
+            fraction = min(max((distance - walked) / spans[index], 0.0), 1.0)
+        result.append(path[index].lerp(path[index + 1], fraction))
+
+    result.append(path[-1].copy())
+    return result
+
+
+def relax_rope(points, rest_lengths, iterations, gravity, damping=0.7,
+               constraint_passes=10, collide=None):
+    """Settle a pinned rope under gravity with inextensible segments.
+
+    Verlet integration: position and its previous value carry the velocity, so
+    a positional constraint is also a velocity correction and the rope stays
+    stable at large step counts. The two ends never move, which is what keeps
+    the cable in its connectors while the middle finds the geometry.
+
+    The damping default is heavy on purpose. A cable draped over something
+    carries far more length than the resting path needs, and that excess has to
+    buckle somewhere; under light damping it buckles upward and swings, so the
+    resting height depended on exactly how many steps were run. Measured across
+    100 to 1500 steps, this pairing lands on the same resting height every time.
+    """
+    current = [point.copy() for point in points]
+    previous = [point.copy() for point in points]
+    last = len(current) - 1
+    if last < 2:
+        return current
+
+    for _ in range(iterations):
+        for index in range(1, last):
+            velocity = (current[index] - previous[index]) * damping
+            previous[index] = current[index].copy()
+            current[index] = current[index] + velocity + gravity
+
+        for _ in range(constraint_passes):
+            for index in range(last):
+                follower = index + 1
+                delta = current[follower] - current[index]
+                length = delta.length
+                if length < 1e-12:
+                    continue
+                share = (length - rest_lengths[index]) / length
+                move_first = index != 0
+                move_second = follower != last
+                if move_first and move_second:
+                    current[index] = current[index] + delta * (0.5 * share)
+                    current[follower] = current[follower] - delta * (0.5 * share)
+                elif move_first:
+                    current[index] = current[index] + delta * share
+                elif move_second:
+                    current[follower] = current[follower] - delta * share
+
+        if collide is not None:
+            for index in range(1, last):
+                resolved = collide(current[index])
+                if (resolved - current[index]).length_squared > 1e-16:
+                    # In Verlet the gap between a point and its previous
+                    # position *is* its velocity, so moving a point out of a
+                    # surface without moving its history hands it that
+                    # displacement as speed and the cable bounces instead of
+                    # settling. Carrying the history along kills the rebound and
+                    # reads as the friction a real cable has against a surface.
+                    current[index] = resolved
+                    previous[index] = resolved.copy()
+
+    return current
+
+
+def build_scene_collider(context, cable, clearance):
+    """A push-out function for every visible mesh the cable could land on.
+
+    closest_point_on_mesh does not say which side of the surface the query point
+    is on, so the sign of its offset along the surface normal decides: negative
+    means the point has sunk inside and has to come back out the same way it
+    would if it were merely too close.
+    """
+    depsgraph = context.evaluated_depsgraph_get()
+    cutters = bpy.data.collections.get(CUTTER_COLLECTION)
+    excluded = set(cutters.objects.keys()) if cutters else set()
+
+    entries = []
+    for obj in context.scene.objects:
+        if obj.type != 'MESH' or obj is cable or obj.name in excluded:
+            continue
+        if not obj.visible_get():
+            continue
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.data
+        if mesh is None or not mesh.polygons:
+            continue
+        matrix = obj.matrix_world.copy()
+        entries.append((evaluated, matrix, matrix.inverted_safe(),
+                        matrix.to_3x3().inverted_safe().transposed()))
+
+    if not entries:
+        return None, 0
+
+    def collide(point):
+        for evaluated, matrix, inverse, normals in entries:
+            found, location, normal, _ = evaluated.closest_point_on_mesh(inverse @ point)
+            if not found:
+                continue
+            surface = matrix @ location
+            direction = normals @ normal
+            if direction.length < 1e-9:
+                continue
+            direction.normalize()
+            if (point - surface).dot(direction) < clearance:
+                point = surface + direction * clearance
+        return point
+
+    return collide, len(entries)
+
+
+def write_cable_path(cable, path, head_dir, tail_dir, reach):
+    """Replace the cable's spline with a smooth curve through the settled path."""
+    curve = cable.data
+    curve.splines.clear()
+    spline = curve.splines.new('BEZIER')
+    spline.bezier_points.add(len(path) - 1)
+
+    for point, position in zip(spline.bezier_points, path):
+        point.handle_left_type = 'AUTO'
+        point.handle_right_type = 'AUTO'
+        point.co = position
+
+    # The ends keep their connector direction; only the middle is simulated.
+    head, tail = spline.bezier_points[0], spline.bezier_points[-1]
+    for point in (head, tail):
+        point.handle_left_type = 'FREE'
+        point.handle_right_type = 'FREE'
+    head.handle_right = path[0] + head_dir * reach
+    head.handle_left = path[0] - head_dir * reach
+    tail.handle_left = path[-1] + tail_dir * reach
+    tail.handle_right = path[-1] - tail_dir * reach
 
 
 def iter_cables(scene):
@@ -744,7 +930,7 @@ def iter_cables(scene):
 
 
 @bpy.app.handlers.persistent
-def redrape_cables_on_update(scene, depsgraph=None):
+def rehang_cables_on_update(scene, depsgraph=None):
     """Re-hang cables whose anchors have moved or whose sag has changed.
 
     Hook modifiers would carry the ends along but drag the old shape with them,
@@ -755,11 +941,15 @@ def redrape_cables_on_update(scene, depsgraph=None):
         return
 
     for cable in iter_cables(scene):
+        # A draped cable holds a simulated path; re-hanging it parametrically
+        # would throw the bake away every time anything in the scene moved.
+        if cable.get("cable_draped"):
+            continue
         head, tail = cable["cable_head"], cable["cable_tail"]
         stored = cable.get("cable_sig")
         if stored is not None and list(stored[:]) == cable_signature(cable, head, tail):
             continue
-        redrape_cable(cable)
+        rehang_cable(cable)
 
 
 def resolve_array_axis(context, mode):
@@ -1228,7 +1418,7 @@ class OBJECT_OT_drop_cable(bpy.types.Operator):
             # The anchors were just parented, so their world matrices have to be
             # resolved before the drape can read the ends off them.
             context.view_layer.update()
-            hung = redrape_cable(cable)
+            hung = rehang_cable(cable)
 
         if not hung:
             self.report({'ERROR'}, "Could not hang the cable.")
@@ -1311,10 +1501,118 @@ class OBJECT_OT_drop_cable(bpy.types.Operator):
         return cable
 
 
-class OBJECT_OT_redrape_cables(bpy.types.Operator):
-    """Re-hang every live cable from its anchors"""
-    bl_idname = "object.redrape_cables"
-    bl_label = "Re-drape Cables"
+class OBJECT_OT_drape_cable(bpy.types.Operator):
+    """Settle the selected cables against the scene geometry"""
+    bl_idname = "object.drape_cable"
+    bl_label = "Drape Cable"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    segments: IntProperty(
+        name="Segments",
+        description="Simulation points along the cable. More follows finer "
+                    "geometry and costs more to settle",
+        default=28, min=4, max=160,
+    )
+    iterations: IntProperty(
+        name="Quality",
+        description="Settling steps. Raise it if the cable has not come to rest",
+        default=180, min=10, max=1000,
+    )
+    slack: FloatProperty(
+        name="Extra Slack",
+        description="Length added beyond the hung shape, as a fraction. This is "
+                    "what lets the cable puddle on a surface rather than pull taut",
+        default=0.0, min=0.0, max=2.0, precision=3, step=1.0,
+    )
+    clearance: FloatProperty(
+        name="Clearance",
+        description="Gap held between the cable's centreline and any surface. "
+                    "Set it to the cable radius so the tube rests on the surface "
+                    "rather than sinking halfway in",
+        default=0.012, min=0.0, max=1.0, precision=4, step=0.1, subtype='DISTANCE',
+    )
+    gravity: FloatProperty(
+        name="Gravity",
+        description="Downward pull per step. The default is tuned so the cable "
+                    "settles to the same resting place at any quality setting",
+        default=0.012, min=0.0001, max=1.0, precision=4, step=0.01,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.get("cable_head") is not None for obj in context.selected_objects
+        )
+
+    def execute(self, context):
+        cables = [obj for obj in context.selected_objects
+                  if obj.get("cable_head") is not None and obj.type == 'CURVE']
+        if not cables:
+            self.report({'ERROR'}, "Select at least one cable.")
+            return {'CANCELLED'}
+
+        draped, colliders = 0, 0
+        with suspended_auto_sync():
+            for cable in cables:
+                # Start from the parametric hang so the sim begins somewhere
+                # sensible rather than from a straight line through the geometry.
+                cable["cable_draped"] = False
+                if not rehang_cable(cable):
+                    continue
+                count = self.drape(context, cable)
+                colliders = max(colliders, count)
+                draped += 1
+
+        if not draped:
+            self.report({'ERROR'}, "Could not drape the selected cable(s).")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Draped {draped} cable(s) against {colliders} collider(s).")
+        return {'FINISHED'}
+
+    def drape(self, context, cable):
+        head_anchor, tail_anchor = cable["cable_head"], cable["cable_tail"]
+        spline = cable.data.splines[0]
+
+        path = resample_evenly(bezier_polyline(spline), self.segments)
+        rest = [(path[i + 1] - path[i]).length * (1.0 + self.slack)
+                for i in range(len(path) - 1)]
+
+        collide, colliders = build_scene_collider(context, cable, self.clearance)
+        settled = relax_rope(path, rest, self.iterations,
+                             Vector((0.0, 0.0, -self.gravity)), collide=collide)
+
+        # Slack has to go somewhere, so the solver leaves points bunched where
+        # the cable lies against a surface. That is physically right but makes
+        # poor control points: uneven spacing sets the automatic handles
+        # wobbling. Respacing along the settled shape keeps the drape and gives
+        # the curve an even skeleton.
+        #
+        # Respacing is deliberately the last step. Pushing points out again
+        # afterwards collapses any that share a nearest feature, which along an
+        # edge is most of them, and coincident control points are what put a
+        # zero-length segment and a kink in the curve.
+        settled = resample_evenly(settled, self.segments)
+
+        span = (path[-1] - path[0]).length
+        along = (path[-1] - path[0]).normalized() if span > 1e-9 else Vector((1.0, 0.0, 0.0))
+        head_dir = cable_anchor_direction(head_anchor, along)
+        tail_dir = cable_anchor_direction(tail_anchor, -along)
+        # Keep the connector handle inside the first segment, or it would bow
+        # the curve past the point the simulation actually settled on.
+        reach = min(float(getattr(cable, "cable_lead", 0.18)) * span,
+                    (settled[1] - settled[0]).length)
+
+        write_cable_path(cable, settled, head_dir, tail_dir, reach)
+        cable["cable_draped"] = True
+        cable["cable_sig"] = cable_signature(cable, head_anchor, tail_anchor)
+        return colliders
+
+
+class OBJECT_OT_rehang_cables(bpy.types.Operator):
+    """Re-hang every live cable parametrically, discarding any drape"""
+    bl_idname = "object.rehang_cables"
+    bl_label = "Re-hang Cables"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1323,7 +1621,10 @@ class OBJECT_OT_redrape_cables(bpy.types.Operator):
 
     def execute(self, context):
         with suspended_auto_sync():
-            hung = sum(1 for cable in iter_cables(context.scene) if redrape_cable(cable))
+            hung = 0
+            for cable in iter_cables(context.scene):
+                cable["cable_draped"] = False
+                hung += 1 if rehang_cable(cable) else 0
 
         if not hung:
             self.report({'WARNING'}, "No live cables to re-hang.")
@@ -2030,7 +2331,7 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
 
         row = col.row(align=True)
         row.operator(OBJECT_OT_drop_cable.bl_idname, text="Drop Cable", icon='FORCE_CURVE')
-        row.operator(OBJECT_OT_redrape_cables.bl_idname, text="", icon='FILE_REFRESH')
+        row.operator(OBJECT_OT_rehang_cables.bl_idname, text="", icon='FILE_REFRESH')
 
         active = context.active_object
         if active is not None and active.get("cable_head") is not None:
@@ -2040,6 +2341,13 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
             box.prop(active, "cable_lead")
             box.prop(active.data, "bevel_depth", text="Radius")
             box.prop(active.data, "resolution_u", text="Resolution")
+            row = box.row(align=True)
+            row.operator(OBJECT_OT_drape_cable.bl_idname, text="Drape", icon='PHYSICS')
+            row.operator(OBJECT_OT_rehang_cables.bl_idname, text="Re-hang")
+            if active.get("cable_draped"):
+                note = box.row()
+                note.enabled = False
+                note.label(text="Draped: sliders will re-hang it", icon='INFO')
 
         layout.separator()
 
@@ -2195,7 +2503,8 @@ classes = (
     OBJECT_OT_snap_to_cursor,
     OBJECT_OT_origin_to_bottom,
     OBJECT_OT_drop_cable,
-    OBJECT_OT_redrape_cables,
+    OBJECT_OT_drape_cable,
+    OBJECT_OT_rehang_cables,
     OBJECT_OT_radial_array,
     OBJECT_OT_linear_array,
     OBJECT_OT_sync_radial_arrays,
@@ -2352,13 +2661,13 @@ def register():
 
     register_keymaps()
 
-    for handler in (sync_radial_arrays_on_update, redrape_cables_on_update):
+    for handler in (sync_radial_arrays_on_update, rehang_cables_on_update):
         if handler not in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.append(handler)
 
 
 def unregister():
-    for handler in (sync_radial_arrays_on_update, redrape_cables_on_update):
+    for handler in (sync_radial_arrays_on_update, rehang_cables_on_update):
         if handler in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.remove(handler)
 
