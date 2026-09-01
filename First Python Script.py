@@ -412,6 +412,130 @@ def _update_bevel_mute(self, context):
         modifier.show_viewport = not self.smart_bevel_mute
 
 
+def ordered_paths(edge_pairs):
+    """Sort loose edges into ordered vertex chains.
+
+    Returns a list of (indices, closed) tuples. Selected edges arrive as an
+    unordered set, but a swept tube needs them walked end to end, and a closed
+    loop needs to be recognised as closed so the tube is not capped mid-run.
+    Branching selections are split at the junction into separate runs.
+    """
+    neighbours = {}
+    for first, second in edge_pairs:
+        neighbours.setdefault(first, []).append(second)
+        neighbours.setdefault(second, []).append(first)
+
+    unused = {frozenset(pair) for pair in edge_pairs}
+
+    def walk(start):
+        chain = [start]
+        closed = False
+        while True:
+            current = chain[-1]
+            step = None
+            for candidate in neighbours.get(current, ()):
+                if frozenset((current, candidate)) in unused:
+                    step = candidate
+                    break
+            if step is None:
+                break
+            unused.discard(frozenset((current, step)))
+            if step == chain[0]:
+                closed = True
+                break
+            chain.append(step)
+        return chain, closed
+
+    paths = []
+
+    # Open runs first, started from their free ends, so a chain is never
+    # picked up from the middle and returned as two half-chains.
+    for vertex in [v for v, linked in neighbours.items() if len(linked) == 1]:
+        while any(frozenset((vertex, other)) in unused for other in neighbours[vertex]):
+            chain, closed = walk(vertex)
+            if len(chain) > 1:
+                paths.append((chain, closed))
+
+    # Whatever survives has no free end, so it is a cycle.
+    while unused:
+        seed = next(iter(next(iter(unused))))
+        chain, closed = walk(seed)
+        if len(chain) < 2:
+            break
+        paths.append((chain, closed))
+
+    return paths
+
+
+def sweep_frames(points, normals, closed):
+    """Yield (point, lateral, up) for each point along a path.
+
+    Up is the surface normal re-orthogonalised against the direction of travel,
+    so the groove's cross-section stays square to the hull. Taking up from the
+    surface rather than propagating a frame along the curve is what stops the
+    tube twisting as it crosses a curved panel.
+    """
+    count = len(points)
+    for index in range(count):
+        point = points[index]
+        if closed:
+            behind, ahead = points[index - 1], points[(index + 1) % count]
+        else:
+            behind = points[index - 1] if index > 0 else point
+            ahead = points[index + 1] if index < count - 1 else point
+
+        tangent = ahead - behind
+        if tangent.length < 1e-12:
+            continue
+        tangent.normalize()
+
+        lateral = tangent.cross(normals[index])
+        if lateral.length < 1e-9:
+            continue  # Surface normal parallel to the path: no usable frame.
+        lateral.normalize()
+
+        yield point, lateral, lateral.cross(tangent).normalized()
+
+
+def panel_tube_geometry(frames, closed, width, depth, overshoot):
+    """Vertices and quads for a rectangular tube swept along the frames.
+
+    The cross-section deliberately pokes overshoot above the surface. A cutter
+    whose top face is flush with the hull hands the solver a coplanar pair,
+    which is the classic way a boolean groove comes out ragged.
+    """
+    half = width * 0.5
+    rings = [
+        [
+            point - lateral * half + up * overshoot,
+            point + lateral * half + up * overshoot,
+            point + lateral * half - up * depth,
+            point - lateral * half - up * depth,
+        ]
+        for point, lateral, up in frames
+    ]
+    if len(rings) < 2:
+        return [], []
+
+    vertices = [corner for ring in rings for corner in ring]
+
+    faces = []
+    segments = len(rings) if closed else len(rings) - 1
+    for index in range(segments):
+        near = index * 4
+        far = ((index + 1) % len(rings)) * 4
+        for corner in range(4):
+            following = (corner + 1) % 4
+            faces.append((near + corner, near + following, far + following, far + corner))
+
+    if not closed:
+        last = (len(rings) - 1) * 4
+        faces.append((0, 1, 2, 3))
+        faces.append((last + 3, last + 2, last + 1, last))
+
+    return vertices, faces
+
+
 def sanitize_filename(name):
     cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
     return cleaned or "Mesh"
@@ -840,6 +964,132 @@ class OBJECT_OT_smart_union(SmartBooleanOptions, bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MESH_OT_panel_line(SmartBooleanOptions, bpy.types.Operator):
+    """Cut a recessed panel line along the selected edges"""
+    bl_idname = "mesh.panel_line"
+    bl_label = "Generate Panel Line"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    width: FloatProperty(
+        name="Groove Width", description="Width of the gap across the hull",
+        default=0.004, min=0.00001, max=1.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+    depth: FloatProperty(
+        name="Cut Depth", description="How far the groove sinks into the hull",
+        default=0.004, min=0.00001, max=1.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+    overshoot: FloatProperty(
+        name="Surface Overshoot",
+        description="How far the cutter stands proud of the hull. Keep it above "
+                    "zero: a cutter flush with the surface hands the solver a "
+                    "coplanar pair, which is how a groove comes out ragged",
+        default=0.001, min=0.0, max=1.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        return (context.mode in {'EDIT_MESH', 'OBJECT'}
+                and active is not None and active.type == 'MESH')
+
+    def draw_extra(self, layout):
+        layout.separator()
+        layout.prop(self, "width")
+        layout.prop(self, "depth")
+        layout.prop(self, "overshoot")
+
+    def execute(self, context):
+        source = context.active_object
+        pairs, positions, normals = self.read_selection(context, source)
+
+        if not pairs:
+            self.report({'ERROR'}, "Select the edges the panel line should follow.")
+            return {'CANCELLED'}
+
+        vertices, faces, runs = [], [], 0
+        for chain, closed in ordered_paths(pairs):
+            frames = list(sweep_frames([positions[index] for index in chain],
+                                       [normals[index] for index in chain], closed))
+            part_vertices, part_faces = panel_tube_geometry(
+                frames, closed, self.width, self.depth, self.overshoot)
+            if not part_faces:
+                continue
+
+            offset = len(vertices)
+            vertices.extend(part_vertices)
+            faces.extend(tuple(index + offset for index in face) for face in part_faces)
+            runs += 1
+
+        if not faces:
+            self.report({'ERROR'}, "Selected edges do not form a usable path.")
+            return {'CANCELLED'}
+
+        cutter = self.build_cutter(context, source, vertices, faces)
+        add_boolean(source, cutter, 'DIFFERENCE', f"Bool_Panel_{cutter.name}", self)
+        stash_operand(context, cutter)
+
+        note = " Tab out to see it." if context.mode == 'EDIT_MESH' else ""
+        self.report({'INFO'}, f"Panel line cut along {runs} run(s).{note}")
+        return {'FINISHED'}
+
+    @staticmethod
+    def read_selection(context, source):
+        """Selected edges as index pairs, plus each vertex's position and normal.
+
+        Works from either mode: edge selection persists in mesh data after
+        leaving Edit Mode, and running from Object Mode keeps object creation
+        out of the edit-mode undo stack.
+        """
+        pairs, positions, normals = [], {}, {}
+
+        if context.mode == 'EDIT_MESH':
+            bm = bmesh.from_edit_mesh(source.data)
+            bm.normal_update()
+            for edge in bm.edges:
+                if not edge.select:
+                    continue
+                first, second = edge.verts
+                pairs.append((first.index, second.index))
+                for vertex in (first, second):
+                    positions[vertex.index] = vertex.co.copy()
+                    normals[vertex.index] = vertex.normal.copy()
+        else:
+            mesh = source.data
+            for edge in mesh.edges:
+                if not edge.select:
+                    continue
+                first, second = edge.vertices
+                pairs.append((first, second))
+                for index in (first, second):
+                    positions[index] = mesh.vertices[index].co.copy()
+                    normals[index] = mesh.vertices[index].normal.copy()
+
+        return pairs, positions, normals
+
+    @staticmethod
+    def build_cutter(context, source, vertices, faces):
+        """A closed mesh tube, built in the source's local space.
+
+        The cutter is a mesh rather than a curve because Blender's Boolean
+        modifier only accepts mesh operands, so a curve cutter cannot drive the
+        cut however good it looks in the viewport.
+        """
+        mesh = bpy.data.meshes.new(f"PanelLine_{source.name}")
+        mesh.from_pydata([tuple(vertex) for vertex in vertices], [], faces)
+        mesh.update()
+
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+        bm.to_mesh(mesh)
+        bm.free()
+
+        cutter = bpy.data.objects.new(mesh.name, mesh)
+        context.scene.collection.objects.link(cutter)
+        cutter.matrix_world = source.matrix_world
+        return cutter
+
+
 # --- SHADING ------------------------------------------------------------------
 
 class OBJECT_OT_smart_bevel(bpy.types.Operator):
@@ -1144,6 +1394,7 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.operator(OBJECT_OT_smart_difference.bl_idname, text="Difference")
         row.operator(OBJECT_OT_smart_slice.bl_idname, text="Slice")
         col.operator(OBJECT_OT_smart_union.bl_idname, text="Union")
+        col.operator(MESH_OT_panel_line.bl_idname, text="Panel Line")
 
         layout.separator()
 
@@ -1312,6 +1563,7 @@ classes = (
     OBJECT_OT_smart_difference,
     OBJECT_OT_smart_slice,
     OBJECT_OT_smart_union,
+    MESH_OT_panel_line,
     OBJECT_OT_smart_bevel,
     OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
