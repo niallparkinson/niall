@@ -269,6 +269,76 @@ def clean_mesh(context, obj, merge_distance, remove_interior):
     return removed_verts - len(obj.data.vertices), removed_faces - len(obj.data.polygons)
 
 
+def mesh_bounds(mesh, matrix, skip_loose=True):
+    """Min and max corners of a mesh, transformed by matrix.
+
+    Loose vertices are excluded by default: a stray vertex left behind by an
+    earlier edit would drag the bounding box away from the visible silhouette
+    and drop the pivot somewhere the model does not reach.
+    """
+    if skip_loose and mesh.polygons:
+        indices = [0] * len(mesh.loops)
+        mesh.loops.foreach_get("vertex_index", indices)
+        vertices = mesh.vertices
+        coords = [matrix @ vertices[index].co for index in set(indices)]
+    else:
+        coords = [matrix @ vertex.co for vertex in mesh.vertices]
+
+    if not coords:
+        return None, None
+
+    low = Vector((min(c.x for c in coords), min(c.y for c in coords), min(c.z for c in coords)))
+    high = Vector((max(c.x for c in coords), max(c.y for c in coords), max(c.z for c in coords)))
+    return low, high
+
+
+def bottom_centre(low, high):
+    """Centre in X and Y, floor in Z - the pivot Unreal expects on a ground prop."""
+    return Vector(((low.x + high.x) * 0.5, (low.y + high.y) * 0.5, low.z))
+
+
+def face_alignment_matrix(obj, faces, active_face):
+    """World matrix whose Z points along the face normal and X along its tangent.
+
+    Normals are transformed by the inverse transpose of the 3x3, not the matrix
+    itself, so a non-uniformly scaled object still yields a perpendicular Z.
+    The tangent comes from the face's longest edge, which gives a repeatable
+    roll: a square cutter lands square to the panel rather than at some
+    arbitrary angle around the normal.
+    """
+    matrix_world = obj.matrix_world
+    normal_matrix = matrix_world.to_3x3().inverted_safe().transposed()
+
+    centre = Vector((0.0, 0.0, 0.0))
+    normal = Vector((0.0, 0.0, 0.0))
+    for face in faces:
+        centre += matrix_world @ face.calc_center_median()
+        normal += normal_matrix @ face.normal
+    centre /= len(faces)
+
+    if normal.length < 1e-9:
+        return None
+    normal.normalize()
+
+    source = active_face if active_face in faces else faces[0]
+    try:
+        tangent = matrix_world.to_3x3() @ source.calc_tangent_edge()
+        tangent -= normal * tangent.dot(normal)
+    except (ValueError, RuntimeError):
+        tangent = None
+
+    if tangent is None or tangent.length < 1e-9:
+        # Degenerate tangent (or a normal parallel to it): fall back to a
+        # tracked rotation, which is stable but has an arbitrary roll.
+        rotation = normal.to_track_quat('Z', 'Y').to_matrix().to_4x4()
+        return Matrix.Translation(centre) @ rotation
+
+    x_axis = tangent.normalized()
+    y_axis = normal.cross(x_axis)
+    basis = Matrix((x_axis, y_axis, normal)).transposed().to_4x4()
+    return Matrix.Translation(centre) @ basis
+
+
 def sanitize_filename(name):
     cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
     return cleaned or "Mesh"
@@ -276,6 +346,186 @@ def sanitize_filename(name):
 
 def selected_meshes(context):
     return [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+
+# --- ORIGIN & ALIGNMENT -------------------------------------------------------
+
+# Modifiers whose result is measured from the object origin, so moving the
+# pivot moves what they build. Mirror is the one that bites on hard-surface.
+ORIGIN_SENSITIVE_MODIFIERS = {'MIRROR', 'SCREW', 'SIMPLE_DEFORM', 'CAST', 'WAVE'}
+
+
+class MESH_OT_cursor_to_face(bpy.types.Operator):
+    """Snap the 3D cursor to the selected face and tilt it to the surface"""
+    bl_idname = "mesh.cursor_to_face"
+    bl_label = "Align Cursor to Face"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH'
+                and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+
+        faces = [face for face in bm.faces if face.select]
+        if not faces:
+            self.report({'ERROR'}, "Select at least one face.")
+            return {'CANCELLED'}
+
+        matrix = face_alignment_matrix(obj, faces, bm.faces.active)
+        if matrix is None:
+            self.report({'ERROR'}, "Selected faces have no usable normal.")
+            return {'CANCELLED'}
+
+        cursor = context.scene.cursor
+        cursor.rotation_mode = 'QUATERNION'
+        cursor.matrix = matrix
+
+        self.report({'INFO'}, f"Cursor aligned to {len(faces)} face(s).")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_snap_to_cursor(bpy.types.Operator):
+    """Move selected objects onto the 3D cursor, flush with its orientation"""
+    bl_idname = "object.snap_to_cursor"
+    bl_label = "Snap to Cursor"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    align_rotation: BoolProperty(
+        name="Match Cursor Rotation",
+        description="Rotate the object flush to the cursor. Turn off to move it "
+                    "without changing how it is oriented",
+        default=True,
+    )
+    offset: FloatProperty(
+        name="Surface Offset",
+        description="Shift along the cursor's Z after snapping, to sit a bolt head "
+                    "proud of the panel or sink a cutter into it",
+        default=0.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and len(context.selected_objects) > 0
+
+    def execute(self, context):
+        cursor_matrix = context.scene.cursor.matrix
+        cursor_location, cursor_rotation, _ = cursor_matrix.decompose()
+        target = cursor_location + (cursor_rotation @ Vector((0.0, 0.0, self.offset)))
+
+        for obj in context.selected_objects:
+            _, rotation, scale = obj.matrix_world.decompose()
+            # Scale is always preserved: a snapped cutter keeps the size it was
+            # dialled in at, and only its placement changes.
+            obj.matrix_world = Matrix.LocRotScale(
+                target,
+                cursor_rotation if self.align_rotation else rotation,
+                scale,
+            )
+
+        self.report({'INFO'}, f"Snapped {len(context.selected_objects)} object(s) to the cursor.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_origin_to_bottom(bpy.types.Operator):
+    """Drop the origin to the bottom centre of the mesh bounds"""
+    bl_idname = "object.origin_to_bottom"
+    bl_label = "Origin to Bottom"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    use_evaluated: BoolProperty(
+        name="Use Modifier Result",
+        description="Measure the bounds after modifiers, matching what actually "
+                    "gets exported. Turn off to measure the base mesh only",
+        default=True,
+    )
+    skip_loose: BoolProperty(
+        name="Ignore Loose Vertices",
+        description="Exclude vertices that belong to no face, so a stray vertex "
+                    "cannot drag the pivot off the model",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
+
+    def execute(self, context):
+        depsgraph = context.evaluated_depsgraph_get()
+        moved = 0
+        shared = []
+        sensitive = set()
+
+        for obj in selected_meshes(context):
+            if obj.data.users > 1:
+                # Mesh data is shared, so transforming it would drag every
+                # linked duplicate along with it.
+                shared.append(obj.name)
+                continue
+
+            low, high = self.measure(obj, depsgraph)
+            if low is None:
+                continue
+
+            sensitive.update(mod.type for mod in obj.modifiers
+                             if mod.type in ORIGIN_SENSITIVE_MODIFIERS)
+
+            self.move_origin(context, obj, bottom_centre(low, high))
+            moved += 1
+
+        if shared:
+            self.report({'WARNING'},
+                        f"Skipped {len(shared)} object(s) with shared mesh data: "
+                        f"{', '.join(shared[:3])}")
+        if sensitive:
+            # The brief assumes the pivot can always move without disturbing the
+            # result. These modifiers measure from the origin, so it cannot.
+            self.report({'WARNING'},
+                        f"Moved the origin under origin-relative modifiers "
+                        f"({', '.join(sorted(sensitive))}); check the result.")
+        if not moved:
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Origin dropped to bottom centre on {moved} object(s).")
+        return {'FINISHED'}
+
+    def measure(self, obj, depsgraph):
+        if not self.use_evaluated:
+            return mesh_bounds(obj.data, obj.matrix_world, self.skip_loose)
+
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh()
+        try:
+            # to_mesh() is in local space, so the object matrix still applies.
+            return mesh_bounds(mesh, obj.matrix_world, self.skip_loose)
+        finally:
+            evaluated.to_mesh_clear()
+
+    @staticmethod
+    def move_origin(context, obj, world_target):
+        """Shift the mesh under the object so the pivot lands on world_target.
+
+        Children are pinned to their world matrices across the change, otherwise
+        moving the parent transform would drag every child with it.
+        """
+        children = [(child, child.matrix_world.copy()) for child in obj.children]
+
+        local_target = obj.matrix_world.inverted_safe() @ world_target
+        obj.data.transform(Matrix.Translation(-local_target))
+
+        matrix = obj.matrix_world.copy()
+        matrix.translation = world_target
+        obj.matrix_world = matrix
+
+        context.view_layer.update()
+        for child, child_matrix in children:
+            child.matrix_world = child_matrix
 
 
 # --- CUTTER VISIBILITY --------------------------------------------------------
@@ -746,13 +996,10 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
 
     @staticmethod
     def recentre_on_bounds(mesh):
-        if not mesh.vertices:
+        low, high = mesh_bounds(mesh, Matrix.Identity(4))
+        if low is None:
             return
-        coords = [vertex.co for vertex in mesh.vertices]
-        low = Vector((min(c.x for c in coords), min(c.y for c in coords), min(c.z for c in coords)))
-        high = Vector((max(c.x for c in coords), max(c.y for c in coords), max(c.z for c in coords)))
-        offset = Vector(((low.x + high.x) * 0.5, (low.y + high.y) * 0.5, low.z))
-        mesh.transform(Matrix.Translation(-offset))
+        mesh.transform(Matrix.Translation(-bottom_centre(low, high)))
 
     @staticmethod
     def write_fbx(context, obj, filepath):
@@ -800,6 +1047,15 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.operator(OBJECT_OT_smart_difference.bl_idname, text="Difference")
         row.operator(OBJECT_OT_smart_slice.bl_idname, text="Slice")
         col.operator(OBJECT_OT_smart_union.bl_idname, text="Union")
+
+        layout.separator()
+
+        layout.label(text="Align & Origin:", icon='ORIENTATION_NORMAL')
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        col.operator(MESH_OT_cursor_to_face.bl_idname, text="Align Cursor to Face")
+        col.operator(OBJECT_OT_snap_to_cursor.bl_idname, text="Snap to Cursor")
+        col.operator(OBJECT_OT_origin_to_bottom.bl_idname, text="Origin to Bottom")
 
         layout.separator()
 
@@ -872,6 +1128,9 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
 
 
 classes = (
+    MESH_OT_cursor_to_face,
+    OBJECT_OT_snap_to_cursor,
+    OBJECT_OT_origin_to_bottom,
     OBJECT_OT_toggle_cutters,
     OBJECT_OT_cutter_display,
     OBJECT_OT_smart_difference,
