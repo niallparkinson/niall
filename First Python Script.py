@@ -1233,10 +1233,13 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         info = box.row()
         if not count:
             info.enabled = False
-            info.label(text="No Smart Bevels in range")
+            info.label(text="No Smart Bevel modifiers in range")
         else:
+            # Counts modifiers, not bevelled edges. One object carries one
+            # Smart_Bevel whose angle limit handles every qualifying edge on the
+            # mesh, so "1" here says nothing about how much geometry it touches.
             span = f"{low}" if low == high else f"{low}-{high}"
-            info.label(text=f"{count} bevel(s) at {span} segments",
+            info.label(text=f"{count} Smart Bevel modifier(s) at {span} segments",
                        icon='CHECKMARK' if low == high else 'INFO')
 
     @staticmethod
