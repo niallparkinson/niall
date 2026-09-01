@@ -1316,7 +1316,7 @@ SCENE_PROPS = {
     ),
     "smart_bevel_width": FloatProperty(
         name="Width",
-        default=0.01, min=0.0001, max=1.0, precision=4, step=0.01,
+        default=0.01, min=0.0001, max=10.0, precision=4, step=0.01,
         subtype='DISTANCE',
         update=_update_bevel_resolution,
     ),
