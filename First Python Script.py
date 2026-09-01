@@ -1200,8 +1200,7 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="High Poly").export_type = 'HIGH'
         row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="Low Poly").export_type = 'LOW'
 
-    @staticmethod
-    def draw_bevel_resolution(context, layout):
+    def draw_bevel_resolution(self, context, layout):
         scene = context.scene
         box = layout.box()
 
@@ -1219,8 +1218,47 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
 
         box.operator(OBJECT_OT_apply_bevel_resolution.bl_idname, icon='FILE_REFRESH')
 
-        # Report what the bevels actually are, not what the slider was last set
-        # to. The two diverge as soon as anything is bevelled outside the slider.
+        # Two readouts, because they answer different questions. The active
+        # object line follows the click and says what is under the cursor; the
+        # scope line says what the slider above would change.
+        self.draw_active_bevel(context, box)
+        self.draw_scope_bevels(context, box)
+
+    @staticmethod
+    def draw_active_bevel(context, layout):
+        active = context.active_object
+        row = layout.row()
+
+        if active is None or active.type != 'MESH':
+            row.enabled = False
+            row.label(text="No active mesh")
+            return
+
+        bevels = [mod for mod in active.modifiers if is_smart_bevel(mod)]
+        if not bevels:
+            row.enabled = False
+            row.label(text=f"{active.name}: no Smart Bevel", icon='DOT')
+            return
+
+        if len(bevels) > 1:
+            row.label(text=f"{active.name}: {len(bevels)} Smart Bevels", icon='INFO')
+            return
+
+        bevel = bevels[0]
+        muted = "" if bevel.show_viewport else "  (muted)"
+        row.label(
+            text=f"{active.name}: {bevel.segments} seg, {bevel.width:.4g} wide{muted}",
+            icon='MOD_BEVEL',
+        )
+
+    @staticmethod
+    def draw_scope_bevels(context, layout):
+        scene = context.scene
+        scope = "Selected" if scene.smart_bevel_selected_only else "Scene"
+
+        # Counts modifiers, not bevelled edges. One object carries one
+        # Smart_Bevel whose angle limit handles every qualifying edge on the
+        # mesh, so "1" here says nothing about how much geometry it touches.
         low = high = None
         count = 0
         for modifier in iter_smart_bevels(scene, context.view_layer,
@@ -1230,16 +1268,13 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
             low = segments if low is None else min(low, segments)
             high = segments if high is None else max(high, segments)
 
-        info = box.row()
+        info = layout.row()
         if not count:
             info.enabled = False
-            info.label(text="No Smart Bevel modifiers in range")
+            info.label(text=f"{scope}: no Smart Bevel modifiers")
         else:
-            # Counts modifiers, not bevelled edges. One object carries one
-            # Smart_Bevel whose angle limit handles every qualifying edge on the
-            # mesh, so "1" here says nothing about how much geometry it touches.
             span = f"{low}" if low == high else f"{low}-{high}"
-            info.label(text=f"{count} Smart Bevel modifier(s) at {span} segments",
+            info.label(text=f"{scope}: {count} modifier(s) at {span} segments",
                        icon='CHECKMARK' if low == high else 'INFO')
 
     @staticmethod
