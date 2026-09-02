@@ -1,20 +1,2065 @@
 bl_info = {
     "name": "Smart Hard Surface Tools",
     "author": "Niall",
-    "version": (1, 4),
+    "version": (1, 9),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar (N) > Addon Test",
     "description": "Automates booleans, shading, UVs, and UE5 exporting.",
     "category": "Object",
 }
 
-import bpy
+import math
 import os
-from bpy.props import FloatProperty, IntProperty, StringProperty, EnumProperty
+import re
+from contextlib import contextmanager
 
-# --- EXISTING BOOLEAN & BEVEL CLASSES ---
+import bmesh
+import bpy
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from mathutils import Matrix, Vector
+from mathutils.geometry import interpolate_bezier
 
-class OBJECT_OT_smart_difference(bpy.types.Operator):
+CUTTER_COLLECTION = "Cutters_Collection"
+ARRAY_COLLECTION = "Array_Helpers"
+ARRAY_RADIAL_MOD = "Array_Radial"
+ARRAY_LINEAR_MOD = "Array_Linear"
+CABLE_COLLECTION = "Cable_Rig"
+
+# Set while an operator is rebuilding a rig, so the depsgraph handlers do not
+# fire against half-written state.
+_auto_sync_suspended = False
+WELD_MOD = "Smart_Weld"
+BEVEL_MOD = "Smart_Bevel"
+VERTEX_BEVEL_MOD = "Smart_Vertex_Bevel"
+WEIGHTED_NORMAL_MOD = "Smart_Weighted_Normal"
+TRIANGULATE_MOD = "Smart_Triangulate"
+
+# Modifiers that must always evaluate after every boolean, in this order.
+# The vertex bevel runs before the edge bevel on purpose. Run the other way
+# round, the edge bevel has already split each corner into a dozen vertices,
+# every one of them inherits the corner's weight, and the vertex bevel then
+# rounds each in place: a measured 342 zero-area faces out of 548 on a single
+# weighted cube corner. Rounding the raw corner first gives 146 clean faces.
+POST_BOOLEAN_HEAD = (WELD_MOD, VERTEX_BEVEL_MOD, BEVEL_MOD)
+POST_BOOLEAN_TAIL = (WEIGHTED_NORMAL_MOD, TRIANGULATE_MOD)
+POST_BOOLEAN_TYPES = {'WELD', 'BEVEL', 'WEIGHTED_NORMAL', 'TRIANGULATE'}
+
+INVALID_FILENAME_CHARS = set('\\/:*?"<>|')
+DUPLICATE_SUFFIX = re.compile(r"\.\d{3}$")
+
+# Blender 4.0 replaced MeshEdge.bevel_weight with generic float attributes.
+# The Bevel modifier reads them by name through its edge_weight and
+# vertex_weight fields, so they are reached as named layers, not as a
+# dedicated field on the element.
+EDGE_WEIGHT_ATTR = "bevel_weight_edge"
+VERT_WEIGHT_ATTR = "bevel_weight_vert"
+
+# A bevel layer is one bevel modifier bound to its own edge attribute, so a
+# mesh can carry several at different widths at once. Blender suffixes both
+# names on collision, and the modifier's edge_weight field is what ties a
+# given modifier back to its own attribute.
+BEVEL_LAYER_MOD = "Smart_Bevel_Layer"
+BEVEL_LAYER_ATTR = "Smart_Bevel_Edge"
+
+
+def _boolean_solver_items():
+    """Read the solver list off the Boolean modifier's RNA.
+
+    Built from RNA rather than hardcoded so the addon picks up whatever solvers
+    the running Blender actually ships (4.5+ adds Manifold alongside Fast and
+    Exact) without a version check.
+    """
+    try:
+        rna = bpy.types.BooleanModifier.bl_rna.properties["solver"]
+        return [(item.identifier, item.name, item.description) for item in rna.enum_items]
+    except Exception:
+        return [('FAST', "Fast", "Simple solver"), ('EXACT', "Exact", "Robust solver")]
+
+
+BOOLEAN_SOLVERS = _boolean_solver_items()
+
+
+# --- HELPERS -----------------------------------------------------------------
+
+@contextmanager
+def sole_active(context, obj, also=()):
+    """Make obj the only selected + active object, then restore the user's selection.
+
+    Every operator that needs bpy.ops to act on one specific object goes through
+    here, so the caller never has to hand-roll (and forget to undo) the
+    deselect/select/active dance.
+    """
+    view_layer = context.view_layer
+    prev_active = view_layer.objects.active
+    prev_selected = list(context.selected_objects)
+    prev_mode = prev_active.mode if prev_active else 'OBJECT'
+
+    if prev_active and prev_active.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    for other in prev_selected:
+        other.select_set(False)
+
+    obj.select_set(True)
+    for extra in also:
+        if extra.name in view_layer.objects:
+            extra.select_set(True)
+    view_layer.objects.active = obj
+    try:
+        yield
+    finally:
+        active = view_layer.objects.active
+        if active and active.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        # obj may have been removed by the caller's teardown.
+        if obj.name in view_layer.objects:
+            obj.select_set(False)
+        for extra in also:
+            if extra.name in view_layer.objects:
+                extra.select_set(False)
+        for other in prev_selected:
+            if other.name in view_layer.objects:
+                other.select_set(True)
+        if prev_active and prev_active.name in view_layer.objects:
+            view_layer.objects.active = prev_active
+            if prev_mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode=prev_mode)
+
+
+def get_helper_collection(context, name, hide_on_create=False):
+    """Fetch or create a hidden utility collection linked to the scene root."""
+    coll = bpy.data.collections.get(name)
+    if coll is not None:
+        return coll
+
+    coll = bpy.data.collections.new(name)
+    context.scene.collection.children.link(coll)
+    coll.hide_render = True
+
+    if hide_on_create:
+        layer = find_layer_collection(context.view_layer.layer_collection, name)
+        if layer is not None:
+            # The eye only, never exclude: excluded objects leave the view layer,
+            # and an array offset object has to stay evaluated to drive the array.
+            layer.hide_viewport = True
+    return coll
+
+
+def get_cutter_collection(context):
+    return get_helper_collection(context, CUTTER_COLLECTION)
+
+
+def stash_in_collection(context, obj, collection):
+    """Move an object so it lives only in the given collection."""
+    if obj.name not in collection.objects:
+        collection.objects.link(obj)
+    for other in obj.users_collection:
+        if other is not collection:
+            other.objects.unlink(obj)
+
+
+def find_layer_collection(layer_collection, name):
+    """Depth-first search for the LayerCollection wrapping a named collection.
+
+    view_layer.layer_collection is a tree mirroring the scene's collection
+    hierarchy, and only the LayerCollection carries the per-view-layer eye
+    toggle, so the collection datablock alone is not enough to find it.
+    """
+    if layer_collection.collection.name == name:
+        return layer_collection
+    for child in layer_collection.children:
+        found = find_layer_collection(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def get_cutter_layer_collection(context):
+    """The cutter collection's LayerCollection, or None if it does not exist yet."""
+    if bpy.data.collections.get(CUTTER_COLLECTION) is None:
+        return None
+    return find_layer_collection(context.view_layer.layer_collection, CUTTER_COLLECTION)
+
+
+def cutters_visible(layer_collection):
+    """True while any cutter is actually on screen.
+
+    Deliberately not just the collection's eye: a cutter hidden individually
+    with H stays hidden when the collection is revealed, so testing the
+    collection alone would make the toggle look broken. Any visible cutter means
+    the next click should hide.
+    """
+    if layer_collection is None or layer_collection.hide_viewport or layer_collection.exclude:
+        return False
+    return any(not obj.hide_get() for obj in layer_collection.collection.objects)
+
+
+def lock_cutter_render_visibility(collection):
+    """Re-assert that cutters never reach a render, whatever the viewport shows."""
+    collection.hide_render = True
+    for obj in collection.objects:
+        obj.hide_render = True
+
+
+def stash_operand(context, operand):
+    """Hide a boolean operand in the cutter collection and set it to wireframe.
+
+    Union operands are not cutters, but they need identical treatment, so they
+    share the one collection rather than proliferating bookkeeping.
+    """
+    stash_in_collection(context, operand, get_cutter_collection(context))
+    operand.display_type = 'WIRE'
+    operand.hide_render = True
+
+
+def add_boolean(target, operand, operation, name, options=None):
+    """Add a boolean modifier ahead of the weld/bevel/weighted-normal stack.
+
+    Booleans appended after the shading stack produce exactly the normal
+    artifacts the bevel setup exists to avoid, so new cuts are moved in front
+    of the first post-boolean modifier.
+    """
+    mod = target.modifiers.new(name=name, type='BOOLEAN')
+    mod.operation = operation
+    mod.object = operand
+    mod.solver = options.solver if options else 'EXACT'
+
+    if options:
+        # Exact-solver only; harmless on other solvers, absent on old builds.
+        if hasattr(mod, "use_hole_tolerant"):
+            mod.use_hole_tolerant = options.hole_tolerant
+        if hasattr(mod, "use_self"):
+            mod.use_self = options.self_intersection
+        # Fast-solver coplanar tolerance.
+        if hasattr(mod, "double_threshold"):
+            mod.double_threshold = options.overlap_threshold
+
+    for index, existing in enumerate(target.modifiers):
+        if existing is not mod and existing.type in POST_BOOLEAN_TYPES:
+            target.modifiers.move(len(target.modifiers) - 1, index)
+            break
+    return mod
+
+
+def ensure_weld(obj, merge_distance, connected_only=True):
+    """Add or update the seam-welding modifier.
+
+    The brief asks for Merge by Distance after the union, but the union is an
+    unapplied modifier, so there is no result mesh in Object Mode to weld. A
+    Weld modifier is the non-destructive equivalent and keeps the whole stack
+    live. Connected mode only merges vertices that already share an edge, so it
+    cleans boolean slivers without collapsing unrelated nearby surfaces.
+    """
+    weld = obj.modifiers.get(WELD_MOD) or obj.modifiers.new(name=WELD_MOD, type='WELD')
+    weld.merge_threshold = merge_distance
+    if hasattr(weld, "mode"):
+        weld.mode = 'CONNECTED' if connected_only else 'ALL'
+    return weld
+
+
+def post_boolean_order(obj):
+    """The tail modifiers for this object, in the order they must evaluate.
+
+    Bevel layers sit between the main bevel and the weighted normal, and are
+    kept in the order they already appear so that re-sorting never reshuffles
+    layers the artist has arranged.
+    """
+    return (list(POST_BOOLEAN_HEAD)
+            + [modifier.name for modifier in obj.modifiers if is_bevel_layer(modifier)]
+            + list(POST_BOOLEAN_TAIL))
+
+
+def sort_post_boolean_stack(obj):
+    """Force weld -> bevels -> weighted normal to the tail of the stack, in order.
+
+    Moving each to the end in sequence leaves them correctly ordered relative to
+    one another and after every boolean, whatever order they were created in.
+    """
+    for name in post_boolean_order(obj):
+        index = obj.modifiers.find(name)
+        if index != -1:
+            obj.modifiers.move(index, len(obj.modifiers) - 1)
+
+
+def auto_unwrap(context, obj, angle_limit, island_margin, clear_seams):
+    """Mark seams on sharp edges and unwrap. Object must be in Object Mode."""
+    if not obj.data.uv_layers:
+        obj.data.uv_layers.new(name="UVMap")
+
+    with sole_active(context, obj):
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+        if clear_seams:
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.mark_seam(clear=True)
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.mesh.edges_select_sharp(sharpness=angle_limit)
+        bpy.ops.mesh.mark_seam(clear=False)
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=island_margin)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def clean_mesh(context, obj, merge_distance, remove_interior):
+    """Weld, strip interior faces and loose geometry, and fix normals.
+
+    This runs on the evaluated export copy rather than the live object because
+    the booleans are unapplied modifiers: interior faces of a union do not exist
+    as editable geometry until the stack has been evaluated. A correct Exact or
+    Manifold union already discards the interior, so on a clean merge the
+    interior pass finds nothing; it earns its place on coplanar overlaps and on
+    operands that were not watertight to begin with.
+    """
+    removed_faces = len(obj.data.polygons)
+    removed_verts = len(obj.data.vertices)
+
+    with sole_active(context, obj):
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.remove_doubles(threshold=merge_distance)
+
+        if remove_interior:
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.mesh.select_mode(type='FACE')
+            bpy.ops.mesh.select_interior_faces()
+            bpy.ops.mesh.delete(type='FACE')
+
+        # Vertices and edges attached to no face at all.
+        bpy.ops.mesh.select_mode(type='VERT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.mesh.select_loose()
+        bpy.ops.mesh.delete(type='VERT')
+
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Count what survived. An open edge here means the mesh about to be written
+    # still has a hole in it, which is worth saying out loud at the point of
+    # export rather than leaving to be discovered in the engine.
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    open_edges = sum(1 for edge in bm.edges if len(edge.link_faces) != 2)
+    bm.free()
+
+    return (removed_verts - len(obj.data.vertices),
+            removed_faces - len(obj.data.polygons),
+            open_edges)
+
+
+def mesh_bounds(mesh, matrix, skip_loose=True):
+    """Min and max corners of a mesh, transformed by matrix.
+
+    Loose vertices are excluded by default: a stray vertex left behind by an
+    earlier edit would drag the bounding box away from the visible silhouette
+    and drop the pivot somewhere the model does not reach.
+    """
+    if skip_loose and mesh.polygons:
+        indices = [0] * len(mesh.loops)
+        mesh.loops.foreach_get("vertex_index", indices)
+        vertices = mesh.vertices
+        coords = [matrix @ vertices[index].co for index in set(indices)]
+    else:
+        coords = [matrix @ vertex.co for vertex in mesh.vertices]
+
+    if not coords:
+        return None, None
+
+    low = Vector((min(c.x for c in coords), min(c.y for c in coords), min(c.z for c in coords)))
+    high = Vector((max(c.x for c in coords), max(c.y for c in coords), max(c.z for c in coords)))
+    return low, high
+
+
+def bottom_centre(low, high):
+    """Centre in X and Y, floor in Z - the pivot Unreal expects on a ground prop."""
+    return Vector(((low.x + high.x) * 0.5, (low.y + high.y) * 0.5, low.z))
+
+
+def face_alignment_matrix(obj, faces, active_face):
+    """World matrix whose Z points along the face normal and X along its tangent.
+
+    Normals are transformed by the inverse transpose of the 3x3, not the matrix
+    itself, so a non-uniformly scaled object still yields a perpendicular Z.
+    The tangent comes from the face's longest edge, which gives a repeatable
+    roll: a square cutter lands square to the panel rather than at some
+    arbitrary angle around the normal.
+    """
+    matrix_world = obj.matrix_world
+    normal_matrix = matrix_world.to_3x3().inverted_safe().transposed()
+
+    centre = Vector((0.0, 0.0, 0.0))
+    normal = Vector((0.0, 0.0, 0.0))
+    for face in faces:
+        centre += matrix_world @ face.calc_center_median()
+        normal += normal_matrix @ face.normal
+    centre /= len(faces)
+
+    if normal.length < 1e-9:
+        return None
+    normal.normalize()
+
+    source = active_face if active_face in faces else faces[0]
+    try:
+        tangent = matrix_world.to_3x3() @ source.calc_tangent_edge()
+        tangent -= normal * tangent.dot(normal)
+    except (ValueError, RuntimeError):
+        tangent = None
+
+    if tangent is None or tangent.length < 1e-9:
+        # Degenerate tangent (or a normal parallel to it): fall back to a
+        # tracked rotation, which is stable but has an arbitrary roll.
+        rotation = normal.to_track_quat('Z', 'Y').to_matrix().to_4x4()
+        return Matrix.Translation(centre) @ rotation
+
+    x_axis = tangent.normalized()
+    y_axis = normal.cross(x_axis)
+    basis = Matrix((x_axis, y_axis, normal)).transposed().to_4x4()
+    return Matrix.Translation(centre) @ basis
+
+
+def is_smart_bevel(modifier):
+    """Only modifiers this addon created: edge, vertex and layer bevels alike.
+
+    Type is checked alongside the name so a hand-built modifier that merely
+    starts with the same word is never touched, and startswith covers the
+    Smart_Bevel.001 Blender produces on some duplications.
+    """
+    return (modifier.type == 'BEVEL'
+            and modifier.name.startswith((BEVEL_MOD, VERTEX_BEVEL_MOD)))
+
+
+def is_bevel_layer(modifier):
+    """A bevel bound to its own edge attribute rather than the shared weight."""
+    return modifier.type == 'BEVEL' and modifier.name.startswith(BEVEL_LAYER_MOD)
+
+
+def bevel_layers(obj):
+    """Every bevel layer on an object, in stack order."""
+    return [modifier for modifier in obj.modifiers if is_bevel_layer(modifier)]
+
+
+def layer_attribute(obj, modifier):
+    """The edge attribute a bevel layer reads, or None if it has been lost.
+
+    The modifier's own edge_weight field is the link, so renaming an attribute
+    in the spreadsheet breaks the pair loudly rather than silently bevelling
+    the wrong edges.
+    """
+    name = getattr(modifier, "edge_weight", "")
+    attribute = obj.data.attributes.get(name) if name else None
+    if attribute is not None and attribute.domain == 'EDGE':
+        return attribute
+    return None
+
+
+def tune_bevel(modifier, width):
+    """Common setup every Smart Bevel shares.
+
+    offset_type is WIDTH rather than Blender's default OFFSET so the number in
+    the panel is the width of the chamfer strip itself. At 0.2 on a cube,
+    OFFSET cuts 0.2 into each face and leaves a strip 0.283 across; WIDTH gives
+    a strip exactly 0.2 across. For a pipeline where a chamfer is specified in
+    millimetres, that is the number the artist actually means.
+
+    face_strength_mode marks the bevel's own faces weak so the Weighted Normal
+    modifier can ignore them.
+    """
+    modifier.offset_type = 'WIDTH'
+    modifier.width = width
+    if hasattr(modifier, "face_strength_mode"):
+        modifier.face_strength_mode = 'FSTR_AFFECTED'
+
+
+def bevel_weight_layer(bm, domain):
+    """The bevel weight float layer for a domain, created if missing."""
+    if domain == 'EDGE':
+        layers, name = bm.edges.layers.float, EDGE_WEIGHT_ATTR
+    else:
+        layers, name = bm.verts.layers.float, VERT_WEIGHT_ATTR
+
+    layer = layers.get(name)
+    return layer if layer is not None else layers.new(name)
+
+
+def iter_smart_bevels(scene, view_layer, selected_only):
+    """Every Smart Bevel in the scene, or only on the selected objects.
+
+    Scoped to scene.objects rather than bpy.data.objects: the latter also holds
+    objects belonging to other scenes and orphaned data, which are not what
+    "the whole scene" means to someone dragging the slider.
+    """
+    objects = view_layer.objects.selected if selected_only else scene.objects
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        for modifier in obj.modifiers:
+            if is_smart_bevel(modifier):
+                yield modifier
+
+
+@contextmanager
+def bevels_at_render_visibility(objects):
+    """Restore muted Smart Bevels for the duration of an export.
+
+    The exporter reads the viewport depsgraph, so a bevel muted for viewport
+    performance would otherwise export as an unbevelled mesh: exactly the
+    silent failure the mute toggle promises not to cause. Each bevel is forced
+    to its own render visibility, then put back.
+    """
+    changed = []
+    for obj in objects:
+        for modifier in obj.modifiers:
+            if is_smart_bevel(modifier) and modifier.show_viewport != modifier.show_render:
+                changed.append((modifier, modifier.show_viewport))
+                modifier.show_viewport = modifier.show_render
+
+    if changed:
+        bpy.context.view_layer.update()
+    try:
+        yield
+    finally:
+        for modifier, previous in changed:
+            modifier.show_viewport = previous
+
+
+def apply_bevel_resolution(scene, view_layer):
+    """Push the scene's bevel settings onto every targeted Smart Bevel."""
+    count = 0
+    for modifier in iter_smart_bevels(scene, view_layer, scene.smart_bevel_selected_only):
+        modifier.segments = scene.smart_bevel_segments
+        if scene.smart_bevel_override_width:
+            modifier.width = scene.smart_bevel_width
+        count += 1
+    return count
+
+
+def _update_bevel_resolution(self, context):
+    apply_bevel_resolution(self, context.view_layer)
+
+
+def _update_bevel_mute(self, context):
+    for modifier in iter_smart_bevels(self, context.view_layer, self.smart_bevel_selected_only):
+        # Viewport only. show_render is never touched, so the export path and
+        # any Blender render still see the bevels.
+        modifier.show_viewport = not self.smart_bevel_mute
+
+
+def ordered_paths(edge_pairs):
+    """Sort loose edges into ordered vertex chains.
+
+    Returns a list of (indices, closed) tuples. Selected edges arrive as an
+    unordered set, but a swept tube needs them walked end to end, and a closed
+    loop needs to be recognised as closed so the tube is not capped mid-run.
+    Branching selections are split at the junction into separate runs.
+    """
+    neighbours = {}
+    for first, second in edge_pairs:
+        neighbours.setdefault(first, []).append(second)
+        neighbours.setdefault(second, []).append(first)
+
+    unused = {frozenset(pair) for pair in edge_pairs}
+
+    def walk(start):
+        chain = [start]
+        closed = False
+        while True:
+            current = chain[-1]
+            step = None
+            for candidate in neighbours.get(current, ()):
+                if frozenset((current, candidate)) in unused:
+                    step = candidate
+                    break
+            if step is None:
+                break
+            unused.discard(frozenset((current, step)))
+            if step == chain[0]:
+                closed = True
+                break
+            chain.append(step)
+        return chain, closed
+
+    paths = []
+
+    # Open runs first, started from their free ends, so a chain is never
+    # picked up from the middle and returned as two half-chains.
+    for vertex in [v for v, linked in neighbours.items() if len(linked) == 1]:
+        while any(frozenset((vertex, other)) in unused for other in neighbours[vertex]):
+            chain, closed = walk(vertex)
+            if len(chain) > 1:
+                paths.append((chain, closed))
+
+    # Whatever survives has no free end, so it is a cycle.
+    while unused:
+        seed = next(iter(next(iter(unused))))
+        chain, closed = walk(seed)
+        if len(chain) < 2:
+            break
+        paths.append((chain, closed))
+
+    return paths
+
+
+def sweep_frames(points, normals, closed):
+    """Yield (point, lateral, up) for each point along a path.
+
+    Up is the surface normal re-orthogonalised against the direction of travel,
+    so the groove's cross-section stays square to the hull. Taking up from the
+    surface rather than propagating a frame along the curve is what stops the
+    tube twisting as it crosses a curved panel.
+    """
+    count = len(points)
+    for index in range(count):
+        point = points[index]
+        if closed:
+            behind, ahead = points[index - 1], points[(index + 1) % count]
+        else:
+            behind = points[index - 1] if index > 0 else point
+            ahead = points[index + 1] if index < count - 1 else point
+
+        tangent = ahead - behind
+        if tangent.length < 1e-12:
+            continue
+        tangent.normalize()
+
+        lateral = tangent.cross(normals[index])
+        if lateral.length < 1e-9:
+            continue  # Surface normal parallel to the path: no usable frame.
+        lateral.normalize()
+
+        yield point, lateral, lateral.cross(tangent).normalized()
+
+
+def panel_tube_geometry(frames, closed, width, depth, overshoot):
+    """Vertices and quads for a rectangular tube swept along the frames.
+
+    The cross-section deliberately pokes overshoot above the surface. A cutter
+    whose top face is flush with the hull hands the solver a coplanar pair,
+    which is the classic way a boolean groove comes out ragged.
+    """
+    half = width * 0.5
+    rings = [
+        [
+            point - lateral * half + up * overshoot,
+            point + lateral * half + up * overshoot,
+            point + lateral * half - up * depth,
+            point - lateral * half - up * depth,
+        ]
+        for point, lateral, up in frames
+    ]
+    if len(rings) < 2:
+        return [], []
+
+    vertices = [corner for ring in rings for corner in ring]
+
+    faces = []
+    segments = len(rings) if closed else len(rings) - 1
+    for index in range(segments):
+        near = index * 4
+        far = ((index + 1) % len(rings)) * 4
+        for corner in range(4):
+            following = (corner + 1) % 4
+            faces.append((near + corner, near + following, far + following, far + corner))
+
+    if not closed:
+        last = (len(rings) - 1) * 4
+        faces.append((0, 1, 2, 3))
+        faces.append((last + 3, last + 2, last + 1, last))
+
+    return vertices, faces
+
+
+def pivot_rotation_matrix(pivot, axis, angle):
+    """World-space transform that rotates by angle about an arbitrary axis line."""
+    return (Matrix.Translation(pivot)
+            @ Matrix.Rotation(angle, 4, axis)
+            @ Matrix.Translation(-pivot))
+
+
+def iter_radial_arrays(scene):
+    """Every (target, modifier, empty) radial array set up in the scene.
+
+    Driven from the target rather than the empty: the modifier already holds the
+    only link that matters, so nothing depends on parenting or on names.
+    """
+    for target in scene.objects:
+        modifier = target.modifiers.get(ARRAY_RADIAL_MOD)
+        if modifier is None or modifier.offset_object is None:
+            continue
+        yield target, modifier, modifier.offset_object
+
+
+def radial_signature(modifier, matrix):
+    """What the empty's placement was computed from, for change detection."""
+    return [float(modifier.count)] + [round(value, 6) for row in matrix for value in row]
+
+
+def sync_radial_array(target, modifier, empty):
+    """Place the offset empty so the array sweeps a ring about the stored pivot.
+
+    The Array modifier builds its per-copy step as inverse(target) @ empty, so
+    the empty must hold R @ target_matrix, where R rotates about the pivot line.
+    The step is then inverse(M) @ R @ M, whose i-th power is inverse(M) @ R^i @ M,
+    placing copy i at R^i applied to the object's world geometry.
+
+    Dropping the target matrix and storing R alone leaves the step as
+    inverse(M) @ R, which is not a rotation at all: it compounds the object's own
+    transform once per copy, so the copies spiral outwards and grow. Verified
+    against Blender rather than derived: E = R @ M holds a ring, E = R does not.
+
+    Pivot and axis are held in world space: the pivot belongs to the 3D cursor,
+    not to the object, so moving the object changes the ring's radius and leaves
+    its centre where it was put.
+    """
+    if "array_pivot" not in empty or "array_axis" not in empty:
+        return False
+
+    matrix = target.matrix_world.copy()
+    pivot = Vector(empty["array_pivot"][:])
+    axis = Vector(empty["array_axis"][:])
+    if axis.length < 1e-9:
+        return False
+
+    angle = 2.0 * math.pi / max(modifier.count, 1)
+    empty.matrix_world = pivot_rotation_matrix(pivot, axis.normalized(), angle) @ matrix
+    empty["array_sig"] = radial_signature(modifier, matrix)
+    return True
+
+
+@contextmanager
+def suspended_auto_sync():
+    """Stop the depsgraph handler running while an operator is mid-rebuild."""
+    global _auto_sync_suspended
+    _auto_sync_suspended = True
+    try:
+        yield
+    finally:
+        _auto_sync_suspended = False
+
+
+@bpy.app.handlers.persistent
+def sync_radial_arrays_on_update(scene, depsgraph=None):
+    """Keep every ring correct as the count changes or the target moves.
+
+    The modifier's count has no update callback, and the empty's placement
+    depends on the target's matrix, so both are watched. Writing re-triggers the
+    handler, so the stored signature gates the write and the second pass finds
+    nothing to do.
+    """
+    if _auto_sync_suspended:
+        return
+
+    for target, modifier, empty in iter_radial_arrays(scene):
+        stored = empty.get("array_sig")
+        if stored is not None and list(stored[:]) == radial_signature(modifier,
+                                                                     target.matrix_world):
+            continue
+        sync_radial_array(target, modifier, empty)
+
+
+def cable_anchor_direction(anchor, fallback):
+    """The direction a cable leaves this connector, in world space.
+
+    Stored when the anchor is made and rotated by whatever the anchor has turned
+    through since, so re-orienting the prop swings the cable's exit with it.
+    """
+    stored = anchor.get("cable_normal")
+    if stored is None:
+        return fallback
+
+    direction = anchor.matrix_world.to_3x3() @ Vector(stored[:])
+    return direction.normalized() if direction.length > 1e-9 else fallback
+
+
+def cable_signature(cable, head, tail):
+    """What the drape was computed from, for change detection."""
+    values = [round(float(getattr(cable, "cable_sag", 0.0)), 6),
+              round(float(getattr(cable, "cable_lead", 0.0)), 6)]
+    for anchor in (head, tail):
+        values += [round(value, 6) for row in anchor.matrix_world for value in row]
+    return values
+
+
+def rehang_cable(cable):
+    """Rebuild a cable's curve from its two anchors and its stored parameters.
+
+    Three control points rather than two: the ends carry the connector's exit
+    direction and the middle carries the droop. The curve passes through its
+    control points, so the sag value is the droop you get, with no correction
+    factor, and the cable leaves the jack along its axis instead of kinking
+    downwards the moment it emerges.
+    """
+    head_anchor = cable.get("cable_head")
+    tail_anchor = cable.get("cable_tail")
+    if head_anchor is None or tail_anchor is None:
+        return False
+
+    curve = cable.data
+    spline = curve.splines[0] if curve.splines else None
+    if spline is None or spline.type != 'BEZIER' or len(spline.bezier_points) != 3:
+        # A draped cable carries a dense simulated spline. Rebuilding it back to
+        # three points is what lets a bake be re-hung or re-draped rather than
+        # being a one-way door.
+        curve.splines.clear()
+        spline = curve.splines.new('BEZIER')
+        spline.bezier_points.add(2)
+
+    start = head_anchor.matrix_world.translation.copy()
+    end = tail_anchor.matrix_world.translation.copy()
+    span = end - start
+    if span.length < 1e-9:
+        return False
+
+    along = span.normalized()
+    droop = float(getattr(cable, "cable_sag", 0.15)) * span.length
+    reach = float(getattr(cable, "cable_lead", 0.15)) * span.length
+
+    head_dir = cable_anchor_direction(head_anchor, along)
+    tail_dir = cable_anchor_direction(tail_anchor, -along)
+
+    head, middle, tail = spline.bezier_points
+    for point in (head, tail):
+        point.handle_left_type = 'FREE'
+        point.handle_right_type = 'FREE'
+    middle.handle_left_type = 'AUTO'
+    middle.handle_right_type = 'AUTO'
+
+    head.co = start
+    head.handle_right = start + head_dir * reach
+    head.handle_left = start - head_dir * reach
+
+    tail.co = end
+    tail.handle_left = end + tail_dir * reach
+    tail.handle_right = end - tail_dir * reach
+
+    middle.co = (start + end) * 0.5 + Vector((0.0, 0.0, -droop))
+
+    cable["cable_sig"] = cable_signature(cable, head_anchor, tail_anchor)
+    return True
+
+
+def _update_cable(self, context):
+    """Re-hang this cable the moment its slider moves.
+
+    Dragging sag or lead is a request for the parametric shape, so it also
+    clears any bake: the alternative is a slider that silently does nothing.
+    """
+    with suspended_auto_sync():
+        self["cable_draped"] = False
+        rehang_cable(self)
+
+
+def bezier_polyline(spline, per_segment=12):
+    """Sample a Bezier spline into a polyline of world-space points."""
+    points = spline.bezier_points
+    path = []
+    for index in range(len(points) - 1):
+        first, second = points[index], points[index + 1]
+        segment = interpolate_bezier(first.co, first.handle_right,
+                                     second.handle_left, second.co, per_segment)
+        path.extend(segment if index == 0 else segment[1:])
+    return [Vector(point) for point in path]
+
+
+def resample_evenly(path, count):
+    """Redistribute a polyline into count points spaced evenly along its length."""
+    if len(path) < 2 or count < 2:
+        return [point.copy() for point in path]
+
+    spans = [(path[index + 1] - path[index]).length for index in range(len(path) - 1)]
+    total = sum(spans)
+    if total < 1e-12:
+        return [path[0].copy() for _ in range(count)]
+
+    result = [path[0].copy()]
+    step = total / (count - 1)
+    index = 0
+    walked = 0.0
+
+    for target in range(1, count - 1):
+        distance = target * step
+        # Degenerate spans are stepped over rather than landed on. A settled
+        # rope bunches where it rests, so its polyline carries near-zero spans;
+        # stopping on one emits the same point twice and leaves a zero-length
+        # segment in the curve.
+        while index < len(spans) - 1 and (spans[index] <= 1e-12
+                                          or walked + spans[index] < distance):
+            walked += spans[index]
+            index += 1
+
+        fraction = 0.0
+        if spans[index] > 1e-12:
+            fraction = min(max((distance - walked) / spans[index], 0.0), 1.0)
+        result.append(path[index].lerp(path[index + 1], fraction))
+
+    result.append(path[-1].copy())
+    return result
+
+
+def relax_rope(points, rest_lengths, iterations, gravity, damping=0.7,
+               constraint_passes=10, collide=None):
+    """Settle a pinned rope under gravity with inextensible segments.
+
+    Verlet integration: position and its previous value carry the velocity, so
+    a positional constraint is also a velocity correction and the rope stays
+    stable at large step counts. The two ends never move, which is what keeps
+    the cable in its connectors while the middle finds the geometry.
+
+    The damping default is heavy on purpose. A cable draped over something
+    carries far more length than the resting path needs, and that excess has to
+    buckle somewhere; under light damping it buckles upward and swings, so the
+    resting height depended on exactly how many steps were run. Measured across
+    100 to 1500 steps, this pairing lands on the same resting height every time.
+    """
+    current = [point.copy() for point in points]
+    previous = [point.copy() for point in points]
+    last = len(current) - 1
+    if last < 2:
+        return current
+
+    for _ in range(iterations):
+        for index in range(1, last):
+            velocity = (current[index] - previous[index]) * damping
+            previous[index] = current[index].copy()
+            current[index] = current[index] + velocity + gravity
+
+        for _ in range(constraint_passes):
+            for index in range(last):
+                follower = index + 1
+                delta = current[follower] - current[index]
+                length = delta.length
+                if length < 1e-12:
+                    continue
+                share = (length - rest_lengths[index]) / length
+                move_first = index != 0
+                move_second = follower != last
+                if move_first and move_second:
+                    current[index] = current[index] + delta * (0.5 * share)
+                    current[follower] = current[follower] - delta * (0.5 * share)
+                elif move_first:
+                    current[index] = current[index] + delta * share
+                elif move_second:
+                    current[follower] = current[follower] - delta * share
+
+        if collide is not None:
+            for index in range(1, last):
+                resolved = collide(current[index])
+                if (resolved - current[index]).length_squared > 1e-16:
+                    # In Verlet the gap between a point and its previous
+                    # position *is* its velocity, so moving a point out of a
+                    # surface without moving its history hands it that
+                    # displacement as speed and the cable bounces instead of
+                    # settling. Carrying the history along kills the rebound and
+                    # reads as the friction a real cable has against a surface.
+                    current[index] = resolved
+                    previous[index] = resolved.copy()
+
+    return current
+
+
+def build_scene_collider(context, cable, clearance):
+    """A push-out function for every visible mesh the cable could land on.
+
+    closest_point_on_mesh does not say which side of the surface the query point
+    is on, so the sign of its offset along the surface normal decides: negative
+    means the point has sunk inside and has to come back out the same way it
+    would if it were merely too close.
+    """
+    depsgraph = context.evaluated_depsgraph_get()
+    cutters = bpy.data.collections.get(CUTTER_COLLECTION)
+    excluded = set(cutters.objects.keys()) if cutters else set()
+
+    entries = []
+    for obj in context.scene.objects:
+        if obj.type != 'MESH' or obj is cable or obj.name in excluded:
+            continue
+        if not obj.visible_get():
+            continue
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.data
+        if mesh is None or not mesh.polygons:
+            continue
+        matrix = obj.matrix_world.copy()
+        entries.append((evaluated, matrix, matrix.inverted_safe(),
+                        matrix.to_3x3().inverted_safe().transposed()))
+
+    if not entries:
+        return None, 0
+
+    def collide(point):
+        for evaluated, matrix, inverse, normals in entries:
+            found, location, normal, _ = evaluated.closest_point_on_mesh(inverse @ point)
+            if not found:
+                continue
+            surface = matrix @ location
+            direction = normals @ normal
+            if direction.length < 1e-9:
+                continue
+            direction.normalize()
+            if (point - surface).dot(direction) < clearance:
+                point = surface + direction * clearance
+        return point
+
+    return collide, len(entries)
+
+
+def write_cable_path(cable, path, head_dir, tail_dir, reach):
+    """Replace the cable's spline with a smooth curve through the settled path."""
+    curve = cable.data
+    curve.splines.clear()
+    spline = curve.splines.new('BEZIER')
+    spline.bezier_points.add(len(path) - 1)
+
+    for point, position in zip(spline.bezier_points, path):
+        point.handle_left_type = 'AUTO'
+        point.handle_right_type = 'AUTO'
+        point.co = position
+
+    # The ends keep their connector direction; only the middle is simulated.
+    head, tail = spline.bezier_points[0], spline.bezier_points[-1]
+    for point in (head, tail):
+        point.handle_left_type = 'FREE'
+        point.handle_right_type = 'FREE'
+    head.handle_right = path[0] + head_dir * reach
+    head.handle_left = path[0] - head_dir * reach
+    tail.handle_left = path[-1] + tail_dir * reach
+    tail.handle_right = path[-1] - tail_dir * reach
+
+
+def iter_cables(scene):
+    for cable in scene.objects:
+        if cable.type != 'CURVE':
+            continue
+        if cable.get("cable_head") is None or cable.get("cable_tail") is None:
+            continue
+        yield cable
+
+
+@bpy.app.handlers.persistent
+def rehang_cables_on_update(scene, depsgraph=None):
+    """Re-hang cables whose anchors have moved or whose sag has changed.
+
+    Hook modifiers would carry the ends along but drag the old shape with them,
+    leaving the droop wrong for the new span. Recomputing gives a cable that is
+    correctly hung for wherever its connectors have ended up.
+    """
+    if _auto_sync_suspended:
+        return
+
+    for cable in iter_cables(scene):
+        # A draped cable holds a simulated path; re-hanging it parametrically
+        # would throw the bake away every time anything in the scene moved.
+        if cable.get("cable_draped"):
+            continue
+        head, tail = cable["cable_head"], cable["cable_tail"]
+        stored = cable.get("cable_sig")
+        if stored is not None and list(stored[:]) == cable_signature(cable, head, tail):
+            continue
+        rehang_cable(cable)
+
+
+def resolve_array_axis(context, mode):
+    """Rotation axis in world space for the chosen mode."""
+    if mode == 'CURSOR':
+        # Pairs with Align Cursor to Face: the cursor's Z is the surface normal,
+        # which is the axis a ring of bolts on that panel should turn about.
+        return (context.scene.cursor.matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+
+    if mode == 'VIEW':
+        space = context.space_data
+        region_3d = getattr(space, "region_3d", None) if space else None
+        if region_3d is not None:
+            direction = region_3d.view_rotation @ Vector((0.0, 0.0, 1.0))
+            dominant = max(range(3), key=lambda index: abs(direction[index]))
+            axis = Vector((0.0, 0.0, 0.0))
+            axis[dominant] = math.copysign(1.0, direction[dominant])
+            return axis
+        return Vector((0.0, 0.0, 1.0))
+
+    axis = Vector((0.0, 0.0, 0.0))
+    axis["XYZ".index(mode)] = 1.0
+    return axis
+
+
+def face_planarity(face):
+    """How far a face bends out of its own plane, relative to its size.
+
+    Relative rather than absolute so one threshold works on a two metre crate
+    side and a two millimetre detail alike. Measured against real geometry, a
+    planar face lands under 1e-7 while a face spanning a cylinder wall lands
+    between 1e-2 and 1e-1, so the two are never close to being confused.
+    """
+    if len(face.verts) < 4:
+        return 0.0
+
+    centre = face.calc_center_median()
+    normal = face.normal
+    extent = max((vert.co - centre).length for vert in face.verts)
+    if extent < 1e-12:
+        return 0.0
+    return max(abs((vert.co - centre).dot(normal)) for vert in face.verts) / extent
+
+
+def diagnose_mesh(bm, planar_tolerance=1e-4, include_quads=False):
+    """Everything about a mesh that would upset an engine, without changing it."""
+    bm.normal_update()
+
+    curved = [face for face in bm.faces
+              if (len(face.verts) > 4 or (include_quads and len(face.verts) == 4))
+              and face_planarity(face) > planar_tolerance]
+    curved_set = set(curved)
+
+    return {
+        "loose_verts": [v for v in bm.verts if not v.link_faces and not v.link_edges],
+        "wire_edges": [e for e in bm.edges if not e.link_faces],
+        # One face means an open edge: a hole, or a boolean that never capped.
+        "holes": [e for e in bm.edges if len(e.link_faces) == 1],
+        # Three or more means surfaces meeting along a seam, which is what
+        # breaks a triangulator's idea of inside and outside.
+        "junctions": [e for e in bm.edges if len(e.link_faces) > 2],
+        "interior_faces": [f for f in bm.faces
+                           if f.edges and all(len(e.link_faces) > 2 for e in f.edges)],
+        "zero_area_faces": [f for f in bm.faces if f.calc_area() < 1e-12],
+        "curved_ngons": curved,
+        "flat_ngons": [f for f in bm.faces
+                       if len(f.verts) > 4 and f not in curved_set],
+    }
+
+
+def sanitize_mesh(bm, merge_distance, dissolve_degenerate, remove_loose,
+                  remove_interior, triangulate_curved, planar_tolerance,
+                  include_quads):
+    """Apply the safe fixes, in the order that stops one undoing another.
+
+    Welding first collapses the micro-geometry that would otherwise be counted
+    as real faces; interior faces go before loose geometry because deleting
+    them strands vertices; triangulation goes last so it only ever sees the
+    faces that survived.
+    """
+    removed = {}
+    before_verts, before_faces = len(bm.verts), len(bm.faces)
+
+    if merge_distance > 0.0:
+        bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=merge_distance)
+    if dissolve_degenerate and merge_distance > 0.0:
+        bmesh.ops.dissolve_degenerate(bm, dist=merge_distance, edges=bm.edges[:])
+    removed["welded_verts"] = before_verts - len(bm.verts)
+
+    if remove_interior:
+        bm.normal_update()
+        interior = [f for f in bm.faces
+                    if f.edges and all(len(e.link_faces) > 2 for e in f.edges)]
+        removed["interior_faces"] = len(interior)
+        if interior:
+            bmesh.ops.delete(bm, geom=interior, context='FACES')
+    else:
+        removed["interior_faces"] = 0
+
+    if remove_loose:
+        stray = [v for v in bm.verts if not v.link_faces]
+        removed["loose_verts"] = len(stray)
+        if stray:
+            bmesh.ops.delete(bm, geom=stray, context='VERTS')
+    else:
+        removed["loose_verts"] = 0
+
+    removed["triangulated"] = 0
+    if triangulate_curved:
+        bm.normal_update()
+        curved = [face for face in bm.faces
+                  if (len(face.verts) > 4 or (include_quads and len(face.verts) == 4))
+                  and face_planarity(face) > planar_tolerance]
+        removed["triangulated"] = len(curved)
+        if curved:
+            bmesh.ops.triangulate(bm, faces=curved)
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    removed["faces_delta"] = len(bm.faces) - before_faces
+    return removed
+
+
+# Quad split rules. Shortest Diagonal is the game-industry default because it
+# avoids the long thin slivers that catch light badly across a flat panel.
+QUAD_METHODS = [
+    ('SHORTEST_DIAGONAL', "Shortest Diagonal", "Split across the shorter diagonal"),
+    ('BEAUTY', "Beauty", "Split for the best-shaped triangles"),
+    ('FIXED', "Fixed", "Always split first to third corner"),
+    ('FIXED_ALTERNATE', "Fixed Alternate", "Always split second to fourth corner"),
+]
+NGON_METHODS = [
+    ('BEAUTY', "Beauty", "Arrange for the best-shaped triangles"),
+    ('CLIP', "Clip", "Clip ears off in order, cheaper and less even"),
+]
+
+
+def configure_triangulation(modifier, quad_method, ngon_method, ngon_only,
+                            keep_custom_normals):
+    """Set a Triangulate modifier to the settings an engine bake wants.
+
+    keep_custom_normals defaults to off in Blender, which is what quietly
+    discards the shading the bevel and weighted normal built. min_vertices is
+    the native way to reach ngons only: 5 leaves quads whole.
+    """
+    modifier.quad_method = quad_method
+    modifier.ngon_method = ngon_method
+    modifier.min_vertices = 5 if ngon_only else 4
+    if hasattr(modifier, "keep_custom_normals"):
+        modifier.keep_custom_normals = keep_custom_normals
+    return modifier
+
+
+def ensure_triangulation(obj, quad_method, ngon_method, ngon_only,
+                         keep_custom_normals):
+    """Add or update the triangulate modifier and keep it at the end of the stack.
+
+    Last is not cosmetic: it has to evaluate after the weighted normal, or it
+    triangulates geometry whose shading has not been built yet.
+    """
+    modifier = (obj.modifiers.get(TRIANGULATE_MOD)
+                or obj.modifiers.new(name=TRIANGULATE_MOD, type='TRIANGULATE'))
+    configure_triangulation(modifier, quad_method, ngon_method, ngon_only,
+                            keep_custom_normals)
+    sort_post_boolean_stack(obj)
+    return modifier
+
+
+# Unreal binds collision to a render mesh by name, so these prefixes are not
+# decoration. UCX is a convex hull; the others are primitive shapes.
+COLLISION_PREFIXES = ("UCX_", "UBX_", "UCP_", "USP_")
+
+
+def strip_asset_affixes(raw_name):
+    """The bare asset name, with Blender's duplicate suffix and SM_/_low removed."""
+    name = DUPLICATE_SUFFIX.sub("", raw_name)
+    if name.startswith("SM_"):
+        name = name[3:]
+    for suffix in ("_high", "_low"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    return name
+
+
+def export_asset_name(raw_name, export_type):
+    """The name the render mesh will carry inside the FBX."""
+    suffix = "_high" if export_type == 'HIGH' else "_low"
+    return sanitize_filename(f"SM_{strip_asset_affixes(raw_name)}{suffix}")
+
+
+def is_collision(obj):
+    return obj.name.startswith(COLLISION_PREFIXES)
+
+
+def collision_hulls(target):
+    """Collision objects parented to a render mesh."""
+    return [child for child in target.children
+            if child.type == 'MESH' and is_collision(child)]
+
+
+@contextmanager
+def names_released(objects):
+    """Park objects on placeholder names so copies can hold the real ones.
+
+    Blender keeps names unique per datablock, so a copy made while the original
+    still holds the name is given a .001 suffix. FBX writes a dot as an
+    underscore, and Unreal matches collision to a render mesh by exact name, so
+    UCX_SM_Archway_low_03 leaves Blender as UCX_SM_Archway_low_03_001 and binds
+    to nothing. Freeing the names first is what stops that.
+    """
+    saved_objects = [(obj, obj.name) for obj in objects]
+    seen = []
+    saved_data = []
+    for obj in objects:
+        if obj.data is not None and obj.data not in seen:
+            seen.append(obj.data)
+            saved_data.append((obj.data, obj.data.name))
+
+    for index, (obj, _) in enumerate(saved_objects):
+        obj.name = f"__released_{index}"
+    for index, (data, _) in enumerate(saved_data):
+        data.name = f"__released_data_{index}"
+
+    try:
+        yield
+    finally:
+        # Restoring only works once the copies holding these names are gone,
+        # so the caller has to keep this open across its own teardown.
+        for data, name in saved_data:
+            data.name = name
+        for obj, name in saved_objects:
+            obj.name = name
+
+
+def sanitize_filename(name):
+    cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
+    return cleaned or "Mesh"
+
+
+def selected_meshes(context):
+    return [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+
+# Types Blender can evaluate straight to a mesh, so a cable can be exported
+# without being converted by hand first.
+EXPORTABLE_TYPES = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
+
+
+def selected_exportable(context):
+    # Collision travels inside its render mesh's file, so it is never a source
+    # on its own: otherwise selecting a desk and its hulls writes four FBXs.
+    return [obj for obj in context.selected_objects
+            if obj.type in EXPORTABLE_TYPES and not is_collision(obj)]
+
+
+# --- ORIGIN & ALIGNMENT -------------------------------------------------------
+
+# Modifiers whose result is measured from the object origin, so moving the
+# pivot moves what they build. Mirror is the one that bites on hard-surface.
+ORIGIN_SENSITIVE_MODIFIERS = {'MIRROR', 'SCREW', 'SIMPLE_DEFORM', 'CAST', 'WAVE'}
+
+
+class MESH_OT_cursor_to_face(bpy.types.Operator):
+    """Snap the 3D cursor to the selected face and tilt it to the surface"""
+    bl_idname = "mesh.cursor_to_face"
+    bl_label = "Align Cursor to Face"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH'
+                and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+
+        faces = [face for face in bm.faces if face.select]
+        if not faces:
+            self.report({'ERROR'}, "Select at least one face.")
+            return {'CANCELLED'}
+
+        matrix = face_alignment_matrix(obj, faces, bm.faces.active)
+        if matrix is None:
+            self.report({'ERROR'}, "Selected faces have no usable normal.")
+            return {'CANCELLED'}
+
+        cursor = context.scene.cursor
+        cursor.rotation_mode = 'QUATERNION'
+        cursor.matrix = matrix
+
+        self.report({'INFO'}, f"Cursor aligned to {len(faces)} face(s).")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_snap_to_cursor(bpy.types.Operator):
+    """Move selected objects onto the 3D cursor, flush with its orientation"""
+    bl_idname = "object.snap_to_cursor"
+    bl_label = "Snap to Cursor"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    align_rotation: BoolProperty(
+        name="Match Cursor Rotation",
+        description="Rotate the object flush to the cursor. Turn off to move it "
+                    "without changing how it is oriented",
+        default=True,
+    )
+    offset: FloatProperty(
+        name="Surface Offset",
+        description="Shift along the cursor's Z after snapping, to sit a bolt head "
+                    "proud of the panel or sink a cutter into it",
+        default=0.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and len(context.selected_objects) > 0
+
+    def execute(self, context):
+        cursor_matrix = context.scene.cursor.matrix
+        cursor_location, cursor_rotation, _ = cursor_matrix.decompose()
+        target = cursor_location + (cursor_rotation @ Vector((0.0, 0.0, self.offset)))
+
+        for obj in context.selected_objects:
+            _, rotation, scale = obj.matrix_world.decompose()
+            # Scale is always preserved: a snapped cutter keeps the size it was
+            # dialled in at, and only its placement changes.
+            obj.matrix_world = Matrix.LocRotScale(
+                target,
+                cursor_rotation if self.align_rotation else rotation,
+                scale,
+            )
+
+        self.report({'INFO'}, f"Snapped {len(context.selected_objects)} object(s) to the cursor.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_origin_to_bottom(bpy.types.Operator):
+    """Drop the origin to the bottom centre of the mesh bounds"""
+    bl_idname = "object.origin_to_bottom"
+    bl_label = "Origin to Bottom"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    use_evaluated: BoolProperty(
+        name="Use Modifier Result",
+        description="Measure the bounds after modifiers, matching what actually "
+                    "gets exported. Turn off to measure the base mesh only",
+        default=True,
+    )
+    skip_loose: BoolProperty(
+        name="Ignore Loose Vertices",
+        description="Exclude vertices that belong to no face, so a stray vertex "
+                    "cannot drag the pivot off the model",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
+
+    def execute(self, context):
+        depsgraph = context.evaluated_depsgraph_get()
+        moved = 0
+        shared = []
+        sensitive = set()
+
+        for obj in selected_meshes(context):
+            if obj.data.users > 1:
+                # Mesh data is shared, so transforming it would drag every
+                # linked duplicate along with it.
+                shared.append(obj.name)
+                continue
+
+            low, high = self.measure(obj, depsgraph)
+            if low is None:
+                continue
+
+            sensitive.update(mod.type for mod in obj.modifiers
+                             if mod.type in ORIGIN_SENSITIVE_MODIFIERS)
+
+            self.move_origin(context, obj, bottom_centre(low, high))
+            moved += 1
+
+        if shared:
+            self.report({'WARNING'},
+                        f"Skipped {len(shared)} object(s) with shared mesh data: "
+                        f"{', '.join(shared[:3])}")
+        if sensitive:
+            # The brief assumes the pivot can always move without disturbing the
+            # result. These modifiers measure from the origin, so it cannot.
+            self.report({'WARNING'},
+                        f"Moved the origin under origin-relative modifiers "
+                        f"({', '.join(sorted(sensitive))}); check the result.")
+        if not moved:
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Origin dropped to bottom centre on {moved} object(s).")
+        return {'FINISHED'}
+
+    def measure(self, obj, depsgraph):
+        if not self.use_evaluated:
+            return mesh_bounds(obj.data, obj.matrix_world, self.skip_loose)
+
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh()
+        try:
+            # to_mesh() is in local space, so the object matrix still applies.
+            return mesh_bounds(mesh, obj.matrix_world, self.skip_loose)
+        finally:
+            evaluated.to_mesh_clear()
+
+    @staticmethod
+    def move_origin(context, obj, world_target):
+        """Shift the mesh under the object so the pivot lands on world_target.
+
+        Children are pinned to their world matrices across the change, otherwise
+        moving the parent transform would drag every child with it.
+        """
+        children = [(child, child.matrix_world.copy()) for child in obj.children]
+
+        local_target = obj.matrix_world.inverted_safe() @ world_target
+        obj.data.transform(Matrix.Translation(-local_target))
+
+        matrix = obj.matrix_world.copy()
+        matrix.translation = world_target
+        obj.matrix_world = matrix
+
+        context.view_layer.update()
+        for child, child_matrix in children:
+            child.matrix_world = child_matrix
+
+
+# --- ARRAYS -------------------------------------------------------------------
+
+class OBJECT_OT_radial_array(bpy.types.Operator):
+    """Array the active object in a ring around the 3D cursor"""
+    bl_idname = "object.radial_array"
+    bl_label = "Radial Array"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    count: IntProperty(
+        name="Count", description="Copies around the full circle",
+        default=6, min=2, max=256,
+    )
+    radius_offset: FloatProperty(
+        name="Radius Offset",
+        description="Slide the object toward or away from the pivot before "
+                    "arraying, to dial the ring's radius without moving it by hand",
+        default=0.0, precision=4, step=1.0, subtype='DISTANCE',
+    )
+    axis_mode: EnumProperty(
+        name="Axis",
+        items=[
+            ('CURSOR', "Cursor Z", "Turn about the 3D cursor's Z, which Align "
+                                   "Cursor to Face points along the surface normal"),
+            ('VIEW', "View", "Turn about the world axis closest to the view direction"),
+            ('X', "X", "Turn about world X"),
+            ('Y', "Y", "Turn about world Y"),
+            ('Z', "Z", "Turn about world Z"),
+        ],
+        default='CURSOR',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and context.active_object is not None
+
+    @staticmethod
+    def slide_radially(target, pivot, axis, distance):
+        """Move the object in or out along its radius from the pivot."""
+        direction = target.matrix_world.translation - pivot
+        unit = axis.normalized()
+        direction -= unit * direction.dot(unit)
+        if direction.length < 1e-9:
+            return
+
+        matrix = target.matrix_world.copy()
+        matrix.translation = matrix.translation + direction.normalized() * distance
+        target.matrix_world = matrix
+
+    def execute(self, context):
+        target = context.active_object
+        axis = resolve_array_axis(context, self.axis_mode)
+        if axis.length < 1e-9:
+            self.report({'ERROR'}, "Could not resolve a rotation axis.")
+            return {'CANCELLED'}
+
+        # Applied before anything is measured. A fresh run leaves this at zero,
+        # and a redo re-applies it from the pre-operator position, so dragging
+        # the slider dials the radius instead of accumulating.
+        if self.radius_offset:
+            self.slide_radially(target, context.scene.cursor.location, axis,
+                                self.radius_offset)
+
+        modifier = (target.modifiers.get(ARRAY_RADIAL_MOD)
+                    or target.modifiers.new(name=ARRAY_RADIAL_MOD, type='ARRAY'))
+        modifier.count = self.count
+        modifier.use_relative_offset = False
+        modifier.use_constant_offset = False
+        modifier.use_object_offset = True
+
+        empty = modifier.offset_object
+        if empty is None or empty.type != 'EMPTY':
+            empty = bpy.data.objects.new(f"ArrayPivot_{target.name}", None)
+            empty.empty_display_type = 'PLAIN_AXES'
+            empty.empty_display_size = 0.1
+            context.scene.collection.objects.link(empty)
+            modifier.offset_object = empty
+
+        empty["array_pivot"] = tuple(context.scene.cursor.location)
+        empty["array_axis"] = tuple(axis.normalized())
+        empty.parent = None
+
+        with suspended_auto_sync():
+            sync_radial_array(target, modifier, empty)
+        stash_in_collection(context, empty,
+                            get_helper_collection(context, ARRAY_COLLECTION, hide_on_create=True))
+        sort_post_boolean_stack(target)
+
+        self.report({'INFO'}, f"Radial array of {self.count} about the 3D cursor.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_linear_array(bpy.types.Operator):
+    """Array the active object in a straight run"""
+    bl_idname = "object.linear_array"
+    bl_label = "Linear Array"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    count: IntProperty(name="Count", default=4, min=1, max=256)
+    axis_mode: EnumProperty(
+        name="Axis",
+        items=[('X', "X", "Along local X"), ('Y', "Y", "Along local Y"),
+               ('Z', "Z", "Along local Z")],
+        default='X',
+    )
+    spacing_mode: EnumProperty(
+        name="Spacing",
+        items=[
+            ('RELATIVE', "Relative", "Multiples of the object's own bounding box, "
+                                     "so the run rescales with the object"),
+            ('CONSTANT', "Constant", "A fixed distance between copies"),
+        ],
+        default='RELATIVE',
+    )
+    factor: FloatProperty(name="Factor", default=1.25, min=-10.0, max=10.0)
+    distance: FloatProperty(
+        name="Distance", default=0.1, min=-10.0, max=10.0,
+        precision=4, step=0.1, subtype='DISTANCE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and context.active_object is not None
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "count")
+        layout.prop(self, "axis_mode")
+        layout.prop(self, "spacing_mode")
+        layout.prop(self, "factor" if self.spacing_mode == 'RELATIVE' else "distance")
+
+    def execute(self, context):
+        target = context.active_object
+        index = "XYZ".index(self.axis_mode)
+
+        modifier = (target.modifiers.get(ARRAY_LINEAR_MOD)
+                    or target.modifiers.new(name=ARRAY_LINEAR_MOD, type='ARRAY'))
+        modifier.count = self.count
+        modifier.use_object_offset = False
+
+        relative = self.spacing_mode == 'RELATIVE'
+        modifier.use_relative_offset = relative
+        modifier.use_constant_offset = not relative
+        for slot in range(3):
+            modifier.relative_offset_displace[slot] = 0.0
+            modifier.constant_offset_displace[slot] = 0.0
+        if relative:
+            modifier.relative_offset_displace[index] = self.factor
+        else:
+            modifier.constant_offset_displace[index] = self.distance
+
+        sort_post_boolean_stack(target)
+
+        self.report({'INFO'}, f"Linear array of {self.count} along {self.axis_mode}.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_sync_radial_arrays(bpy.types.Operator):
+    """Re-space every radial array from its current modifier count"""
+    bl_idname = "object.sync_radial_arrays"
+    bl_label = "Sync Radial Arrays"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(True for _ in iter_radial_arrays(context.scene))
+
+    def execute(self, context):
+        # The handler keeps these in step already; this is a manual repair for
+        # anything that has drifted, such as a hand-edited empty.
+        synced = sum(1 for entry in iter_radial_arrays(context.scene)
+                     if sync_radial_array(*entry))
+        if not synced:
+            self.report({'WARNING'}, "No radial arrays to sync.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Re-spaced {synced} radial array(s).")
+        return {'FINISHED'}
+
+
+# --- CABLES -------------------------------------------------------------------
+
+# Blender's round bevel builds 4 * (resolution + 1) sides.
+CABLE_PROFILES = [
+    ('0', "4-sided", "Cheapest silhouette, for distant or thin wires"),
+    ('1', "8-sided", "Octagonal, the usual game-ready cable"),
+    ('2', "12-sided", "Rounder, for cables read close up"),
+    ('3', "16-sided", "Smooth, for hero pieces"),
+]
+
+
+class OBJECT_OT_drop_cable(bpy.types.Operator):
+    """Hang a live cable between two selected points"""
+    bl_idname = "object.drop_cable"
+    bl_label = "Drop Cable"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    sag: FloatProperty(
+        name="Sag",
+        description="Droop at the middle, as a fraction of the distance spanned. "
+                    "Relative rather than absolute so the same value reads the "
+                    "same on a short jumper and a long power run",
+        default=0.15, min=0.0, max=3.0, precision=3, step=1.0,
+    )
+    lead: FloatProperty(
+        name="Connector Lead",
+        description="How far the cable runs straight out of the connector before "
+                    "it starts to fall, as a fraction of the span. Zero kinks it "
+                    "downwards right at the plug",
+        default=0.18, min=0.0, max=1.0, precision=3, step=1.0,
+    )
+    radius: FloatProperty(
+        name="Radius", description="Cable thickness",
+        default=0.01, min=0.00001, max=1.0, precision=4, step=0.1, subtype='DISTANCE',
+    )
+    profile: EnumProperty(name="Profile", items=CABLE_PROFILES, default='1')
+    resolution: IntProperty(
+        name="Length Resolution",
+        description="Segments along the cable. Lower is cheaper and reads fine "
+                    "on a cable that is mostly silhouette",
+        default=8, min=1, max=32,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode in {'EDIT_MESH', 'OBJECT'}
+
+    def execute(self, context):
+        endpoints = self.read_endpoints(context)
+        if len(endpoints) < 2:
+            self.report({'ERROR'}, "Select two vertices, two faces, or two objects.")
+            return {'CANCELLED'}
+
+        (start, head_normal, head_source), (end, tail_normal, tail_source) = endpoints[:2]
+        if (end - start).length < 1e-6:
+            self.report({'ERROR'}, "The two points are in the same place.")
+            return {'CANCELLED'}
+
+        with suspended_auto_sync():
+            head = self.build_anchor(context, "CableEnd", start, head_normal, head_source)
+            tail = self.build_anchor(context, "CableEnd", end, tail_normal, tail_source)
+            cable = self.build_cable(context, head, tail)
+            # The anchors were just parented, so their world matrices have to be
+            # resolved before the drape can read the ends off them.
+            context.view_layer.update()
+            hung = rehang_cable(cable)
+
+        if not hung:
+            self.report({'ERROR'}, "Could not hang the cable.")
+            return {'CANCELLED'}
+
+        anchored = sum(1 for source in (head_source, tail_source) if source is not None)
+        self.report({'INFO'}, f"Cable hung over {(end - start).length:.3f}, "
+                              f"{anchored} end(s) anchored to their source.")
+        return {'FINISHED'}
+
+    @staticmethod
+    def read_endpoints(context):
+        """(world point, world normal or None, source object) for each end."""
+        if context.mode == 'EDIT_MESH':
+            obj = context.active_object
+            if obj is None or obj.type != 'MESH':
+                return []
+
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.normal_update()
+            # Normals need the inverse transpose, or a scaled prop sends the
+            # cable out at the wrong angle to its own surface.
+            normals = obj.matrix_world.to_3x3().inverted_safe().transposed()
+
+            faces = [face for face in bm.faces if face.select]
+            if len(faces) >= 2:
+                return [(obj.matrix_world @ face.calc_center_median(),
+                         (normals @ face.normal).normalized(), obj) for face in faces[:2]]
+
+            verts = [vert for vert in bm.verts if vert.select]
+            return [(obj.matrix_world @ vert.co.copy(),
+                     (normals @ vert.normal).normalized(), obj) for vert in verts[:2]]
+
+        return [(obj.matrix_world.translation.copy(), None, obj)
+                for obj in context.selected_objects[:2]]
+
+    @staticmethod
+    def build_anchor(context, name, position, normal, source):
+        """A grabbable empty at one end, riding along with the prop it came from."""
+        anchor = bpy.data.objects.new(name, None)
+        anchor.empty_display_type = 'SPHERE'
+        anchor.empty_display_size = 0.02
+        context.scene.collection.objects.link(anchor)
+
+        if source is not None:
+            # The parent inverse cancels the parent's current matrix, so the
+            # basis is the world matrix outright: no evaluated state involved.
+            anchor.parent = source
+            anchor.matrix_parent_inverse = source.matrix_world.inverted_safe()
+        anchor.matrix_basis = Matrix.Translation(position)
+
+        if normal is not None:
+            anchor["cable_normal"] = tuple(normal)
+
+        stash_in_collection(context, anchor,
+                            get_helper_collection(context, CABLE_COLLECTION))
+        return anchor
+
+    def build_cable(self, context, head, tail):
+        curve = bpy.data.curves.new("Cable", 'CURVE')
+        curve.dimensions = '3D'
+        curve.resolution_u = self.resolution
+        curve.bevel_depth = self.radius
+        curve.bevel_resolution = int(self.profile)
+        curve.fill_mode = 'FULL'
+        # Capped so the cable is a closed solid rather than an open pipe. The
+        # caps arrive as unwelded duplicates; the exporter's merge pass closes
+        # them, which is what UE5 needs.
+        curve.use_fill_caps = True
+
+        spline = curve.splines.new('BEZIER')
+        spline.bezier_points.add(2)
+
+        cable = bpy.data.objects.new(curve.name, curve)
+        context.scene.collection.objects.link(cable)
+        cable["cable_head"] = head
+        cable["cable_tail"] = tail
+        cable.cable_sag = self.sag
+        cable.cable_lead = self.lead
+        return cable
+
+
+class OBJECT_OT_drape_cable(bpy.types.Operator):
+    """Settle the selected cables against the scene geometry"""
+    bl_idname = "object.drape_cable"
+    bl_label = "Drape Cable"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    segments: IntProperty(
+        name="Segments",
+        description="Simulation points along the cable. More follows finer "
+                    "geometry and costs more to settle",
+        default=28, min=4, max=160,
+    )
+    iterations: IntProperty(
+        name="Quality",
+        description="Settling steps. Raise it if the cable has not come to rest",
+        default=180, min=10, max=1000,
+    )
+    slack: FloatProperty(
+        name="Extra Slack",
+        description="Length added beyond the hung shape, as a fraction. This is "
+                    "what lets the cable puddle on a surface rather than pull taut",
+        default=0.0, min=0.0, max=2.0, precision=3, step=1.0,
+    )
+    clearance: FloatProperty(
+        name="Clearance",
+        description="Gap held between the cable's centreline and any surface. "
+                    "Set it to the cable radius so the tube rests on the surface "
+                    "rather than sinking halfway in",
+        default=0.012, min=0.0, max=1.0, precision=4, step=0.1, subtype='DISTANCE',
+    )
+    gravity: FloatProperty(
+        name="Gravity",
+        description="Downward pull per step. The default is tuned so the cable "
+                    "settles to the same resting place at any quality setting",
+        default=0.012, min=0.0001, max=1.0, precision=4, step=0.01,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.get("cable_head") is not None for obj in context.selected_objects
+        )
+
+    def execute(self, context):
+        cables = [obj for obj in context.selected_objects
+                  if obj.get("cable_head") is not None and obj.type == 'CURVE']
+        if not cables:
+            self.report({'ERROR'}, "Select at least one cable.")
+            return {'CANCELLED'}
+
+        draped, colliders = 0, 0
+        with suspended_auto_sync():
+            for cable in cables:
+                # Start from the parametric hang so the sim begins somewhere
+                # sensible rather than from a straight line through the geometry.
+                cable["cable_draped"] = False
+                if not rehang_cable(cable):
+                    continue
+                count = self.drape(context, cable)
+                colliders = max(colliders, count)
+                draped += 1
+
+        if not draped:
+            self.report({'ERROR'}, "Could not drape the selected cable(s).")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Draped {draped} cable(s) against {colliders} collider(s).")
+        return {'FINISHED'}
+
+    def drape(self, context, cable):
+        head_anchor, tail_anchor = cable["cable_head"], cable["cable_tail"]
+        spline = cable.data.splines[0]
+
+        path = resample_evenly(bezier_polyline(spline), self.segments)
+        rest = [(path[i + 1] - path[i]).length * (1.0 + self.slack)
+                for i in range(len(path) - 1)]
+
+        collide, colliders = build_scene_collider(context, cable, self.clearance)
+        settled = relax_rope(path, rest, self.iterations,
+                             Vector((0.0, 0.0, -self.gravity)), collide=collide)
+
+        # Slack has to go somewhere, so the solver leaves points bunched where
+        # the cable lies against a surface. That is physically right but makes
+        # poor control points: uneven spacing sets the automatic handles
+        # wobbling. Respacing along the settled shape keeps the drape and gives
+        # the curve an even skeleton.
+        #
+        # Respacing is deliberately the last step. Pushing points out again
+        # afterwards collapses any that share a nearest feature, which along an
+        # edge is most of them, and coincident control points are what put a
+        # zero-length segment and a kink in the curve.
+        settled = resample_evenly(settled, self.segments)
+
+        span = (path[-1] - path[0]).length
+        along = (path[-1] - path[0]).normalized() if span > 1e-9 else Vector((1.0, 0.0, 0.0))
+        head_dir = cable_anchor_direction(head_anchor, along)
+        tail_dir = cable_anchor_direction(tail_anchor, -along)
+        # Keep the connector handle inside the first segment, or it would bow
+        # the curve past the point the simulation actually settled on.
+        reach = min(float(getattr(cable, "cable_lead", 0.18)) * span,
+                    (settled[1] - settled[0]).length)
+
+        write_cable_path(cable, settled, head_dir, tail_dir, reach)
+        cable["cable_draped"] = True
+        cable["cable_sig"] = cable_signature(cable, head_anchor, tail_anchor)
+        return colliders
+
+
+class OBJECT_OT_rehang_cables(bpy.types.Operator):
+    """Re-hang every live cable parametrically, discarding any drape"""
+    bl_idname = "object.rehang_cables"
+    bl_label = "Re-hang Cables"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(True for _ in iter_cables(context.scene))
+
+    def execute(self, context):
+        with suspended_auto_sync():
+            hung = 0
+            for cable in iter_cables(context.scene):
+                cable["cable_draped"] = False
+                hung += 1 if rehang_cable(cable) else 0
+
+        if not hung:
+            self.report({'WARNING'}, "No live cables to re-hang.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Re-hung {hung} cable(s).")
+        return {'FINISHED'}
+
+
+# --- CUTTER VISIBILITY --------------------------------------------------------
+
+class OBJECT_OT_toggle_cutters(bpy.types.Operator):
+    """Show or hide every cutter without touching anything else in the scene"""
+    bl_idname = "object.toggle_cutters"
+    bl_label = "Toggle Cutters"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # No selection requirement: this has to work whatever is under the cursor.
+        return bpy.data.collections.get(CUTTER_COLLECTION) is not None
+
+    def execute(self, context):
+        layer_coll = get_cutter_layer_collection(context)
+        if layer_coll is None:
+            self.report({'WARNING'}, f"{CUTTER_COLLECTION} is not linked to this view layer.")
+            return {'CANCELLED'}
+
+        collection = layer_coll.collection
+        hiding = cutters_visible(layer_coll)
+
+        # Only ever the eye. Never exclude: that pulls the collection out of the
+        # view layer, which is a far heavier operation than hiding a display,
+        # and clearing it is the only safe direction to move it in.
+        if layer_coll.exclude:
+            layer_coll.exclude = False
+
+        layer_coll.hide_viewport = hiding
+        for obj in collection.objects:
+            obj.hide_set(hiding)
+
+        # Viewport state is the only thing this operator owns.
+        lock_cutter_render_visibility(collection)
+
+        count = len(collection.objects)
+        self.report({'INFO'}, f"{'Hid' if hiding else 'Revealed'} {count} cutter(s).")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_cutter_display(bpy.types.Operator):
+    """Switch cutters between wireframe and solid display"""
+    bl_idname = "object.cutter_display"
+    bl_label = "Toggle Cutter Display"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        collection = bpy.data.collections.get(CUTTER_COLLECTION)
+        return collection is not None and len(collection.objects) > 0
+
+    def execute(self, context):
+        collection = bpy.data.collections[CUTTER_COLLECTION]
+        to_solid = any(obj.display_type == 'WIRE' for obj in collection.objects)
+        for obj in collection.objects:
+            obj.display_type = 'SOLID' if to_solid else 'WIRE'
+
+        self.report({'INFO'}, f"Cutters set to {'solid' if to_solid else 'wireframe'}.")
+        return {'FINISHED'}
+
+
+# --- BOOLEAN & CUTTER OPERATORS ----------------------------------------------
+
+class SmartBooleanOptions:
+    """Solver settings shared by every boolean operator.
+
+    Annotations on a plain mixin are picked up by register_class, the same way
+    bpy_extras.io_utils.ExportHelper supplies filepath to exporters.
+    """
+
+    solver: EnumProperty(
+        name="Solver",
+        description="Exact handles coplanar faces correctly; Fast is the escape "
+                    "hatch for dense meshes where Exact hangs",
+        items=BOOLEAN_SOLVERS,
+        default='EXACT',
+    )
+    hole_tolerant: BoolProperty(
+        name="Hole Tolerant",
+        description="Let the Exact solver cope with operands that are not fully "
+                    "watertight",
+        default=False,
+    )
+    self_intersection: BoolProperty(
+        name="Self Intersection",
+        description="Correctly handle operands whose own geometry overlaps itself",
+        default=False,
+    )
+    overlap_threshold: FloatProperty(
+        name="Overlap Threshold",
+        description="Coplanar tolerance used by the Fast solver",
+        default=1e-6, min=0.0, max=1.0, precision=6, step=0.001,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "solver")
+        if self.solver == 'FAST':
+            layout.prop(self, "overlap_threshold")
+        else:
+            layout.prop(self, "hole_tolerant")
+            layout.prop(self, "self_intersection")
+        self.draw_extra(layout)
+
+    def draw_extra(self, layout):
+        """Hook for operators with options beyond the shared solver settings."""
+
+
+class OBJECT_OT_smart_difference(SmartBooleanOptions, bpy.types.Operator):
     """Apply Smart Difference Boolean and organize cutter"""
     bl_idname = "object.smart_difference"
     bl_label = "Smart Difference"
@@ -22,39 +2067,26 @@ class OBJECT_OT_smart_difference(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return len(context.selected_objects) >= 2 and context.active_object is not None
+        return (context.mode == 'OBJECT'
+                and context.active_object is not None
+                and len(context.selected_objects) >= 2)
 
     def execute(self, context):
         target = context.active_object
-        cutters = [obj for obj in context.selected_objects if obj != target]
-        if not cutters: return {'CANCELLED'}
-
-        cutter_coll_name = "Cutters_Collection"
-        cutter_coll = bpy.data.collections.get(cutter_coll_name)
-        if not cutter_coll:
-            cutter_coll = bpy.data.collections.new(cutter_coll_name)
-            context.scene.collection.children.link(cutter_coll)
-            cutter_coll.hide_render = True 
+        cutters = [obj for obj in context.selected_objects if obj is not target]
+        if not cutters:
+            self.report({'ERROR'}, "Select at least one cutter alongside the target.")
+            return {'CANCELLED'}
 
         for cutter in cutters:
-            mod = target.modifiers.new(name=f"Bool_Diff_{cutter.name}", type='BOOLEAN')
-            mod.operation = 'DIFFERENCE'
-            mod.object = cutter
-            mod.solver = 'EXACT'
-
-            if cutter.name not in cutter_coll.objects:
-                cutter_coll.objects.link(cutter)
-                for coll in cutter.users_collection:
-                    if coll != cutter_coll: coll.objects.unlink(cutter)
-
-            cutter.display_type = 'WIRE'
-            cutter.hide_render = True
+            add_boolean(target, cutter, 'DIFFERENCE', f"Bool_Diff_{cutter.name}", self)
+            stash_operand(context, cutter)
 
         self.report({'INFO'}, f"Applied {len(cutters)} smart booleans.")
         return {'FINISHED'}
 
 
-class OBJECT_OT_smart_slice(bpy.types.Operator):
+class OBJECT_OT_smart_slice(SmartBooleanOptions, bpy.types.Operator):
     """Cut and detach a piece from the target object"""
     bl_idname = "object.smart_slice"
     bl_label = "Smart Slice"
@@ -62,47 +2094,228 @@ class OBJECT_OT_smart_slice(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return len(context.selected_objects) >= 2 and context.active_object is not None
+        return (context.mode == 'OBJECT'
+                and context.active_object is not None
+                and len(context.selected_objects) >= 2)
 
     def execute(self, context):
         target = context.active_object
-        cutters = [obj for obj in context.selected_objects if obj != target]
-        if not cutters: return {'CANCELLED'}
+        cutters = [obj for obj in context.selected_objects if obj is not target]
+        if not cutters:
+            self.report({'ERROR'}, "Select at least one cutter alongside the target.")
+            return {'CANCELLED'}
 
-        cutter_coll_name = "Cutters_Collection"
-        cutter_coll = bpy.data.collections.get(cutter_coll_name)
-        if not cutter_coll:
-            cutter_coll = bpy.data.collections.new(cutter_coll_name)
-            context.scene.collection.children.link(cutter_coll)
-            cutter_coll.hide_render = True 
-
+        # Every slice is copied before any DIFFERENCE lands on the target, so
+        # slice N is not pre-cut by cutters 1..N-1 from this same operation.
+        # Cuts made in earlier operations are inherited on purpose.
         for cutter in cutters:
             slice_obj = target.copy()
             slice_obj.data = target.data.copy()
             slice_obj.name = f"{target.name}_Slice"
-            for coll in target.users_collection: coll.objects.link(slice_obj)
+            for coll in target.users_collection:
+                coll.objects.link(slice_obj)
+            add_boolean(slice_obj, cutter, 'INTERSECT', f"Bool_Slice_{cutter.name}", self)
 
-            mod_intersect = slice_obj.modifiers.new(name=f"Bool_Slice_{cutter.name}", type='BOOLEAN')
-            mod_intersect.operation = 'INTERSECT'
-            mod_intersect.object = cutter
-            mod_intersect.solver = 'EXACT'
-
-            mod_diff = target.modifiers.new(name=f"Bool_Diff_{cutter.name}", type='BOOLEAN')
-            mod_diff.operation = 'DIFFERENCE'
-            mod_diff.object = cutter
-            mod_diff.solver = 'EXACT'
-
-            if cutter.name not in cutter_coll.objects:
-                cutter_coll.objects.link(cutter)
-                for coll in cutter.users_collection:
-                    if coll != cutter_coll: coll.objects.unlink(cutter)
-
-            cutter.display_type = 'WIRE'
-            cutter.hide_render = True
+        for cutter in cutters:
+            add_boolean(target, cutter, 'DIFFERENCE', f"Bool_Diff_{cutter.name}", self)
+            stash_operand(context, cutter)
 
         self.report({'INFO'}, f"Sliced {len(cutters)} pieces from {target.name}.")
         return {'FINISHED'}
 
+
+class OBJECT_OT_smart_union(SmartBooleanOptions, bpy.types.Operator):
+    """Merge shapes into the active object and clean up the new seam"""
+    bl_idname = "object.smart_union"
+    bl_label = "Smart Union"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    weld_seams: BoolProperty(
+        name="Weld Seams",
+        description="Add a Weld modifier after the union so rogue vertices along "
+                    "the intersection cannot break the Smart Bevel",
+        default=True,
+    )
+    weld_distance: FloatProperty(
+        name="Weld Distance",
+        description="Merge distance for the seam weld. Keep this well below your "
+                    "smallest intended detail",
+        default=0.0001, min=0.0, max=0.1, precision=5, step=0.001,
+        subtype='DISTANCE',
+    )
+    weld_connected_only: BoolProperty(
+        name="Connected Only",
+        description="Only merge vertices that already share an edge. Turn off to "
+                    "merge every vertex pair within the distance, which is more "
+                    "thorough and more destructive",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and context.active_object is not None
+                and context.active_object.type == 'MESH'
+                and len(context.selected_objects) >= 2)
+
+    def draw_extra(self, layout):
+        layout.separator()
+        layout.prop(self, "weld_seams")
+        if self.weld_seams:
+            layout.prop(self, "weld_distance")
+            layout.prop(self, "weld_connected_only")
+
+    def execute(self, context):
+        target = context.active_object
+        operands = [obj for obj in context.selected_objects
+                    if obj is not target and obj.type == 'MESH']
+        if not operands:
+            self.report({'ERROR'}, "Select at least one mesh to merge into the active object.")
+            return {'CANCELLED'}
+
+        for operand in operands:
+            add_boolean(target, operand, 'UNION', f"Bool_Union_{operand.name}", self)
+            stash_operand(context, operand)
+
+        if self.weld_seams:
+            ensure_weld(target, self.weld_distance, self.weld_connected_only)
+
+        # Union must evaluate before the bevel so the new seam is bevelled with
+        # everything else, and before the weighted normal so the seam shades
+        # like the rest of the surface.
+        sort_post_boolean_stack(target)
+
+        self.report({'INFO'}, f"Merged {len(operands)} object(s) into {target.name}.")
+        return {'FINISHED'}
+
+
+class MESH_OT_panel_line(SmartBooleanOptions, bpy.types.Operator):
+    """Cut a recessed panel line along the selected edges"""
+    bl_idname = "mesh.panel_line"
+    bl_label = "Generate Panel Line"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    width: FloatProperty(
+        name="Groove Width", description="Width of the gap across the hull",
+        default=0.004, min=0.00001, max=1.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+    depth: FloatProperty(
+        name="Cut Depth", description="How far the groove sinks into the hull",
+        default=0.004, min=0.00001, max=1.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+    overshoot: FloatProperty(
+        name="Surface Overshoot",
+        description="How far the cutter stands proud of the hull. Keep it above "
+                    "zero: a cutter flush with the surface hands the solver a "
+                    "coplanar pair, which is how a groove comes out ragged",
+        default=0.001, min=0.0, max=1.0, precision=4, step=0.01, subtype='DISTANCE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        return (context.mode in {'EDIT_MESH', 'OBJECT'}
+                and active is not None and active.type == 'MESH')
+
+    def draw_extra(self, layout):
+        layout.separator()
+        layout.prop(self, "width")
+        layout.prop(self, "depth")
+        layout.prop(self, "overshoot")
+
+    def execute(self, context):
+        source = context.active_object
+        pairs, positions, normals = self.read_selection(context, source)
+
+        if not pairs:
+            self.report({'ERROR'}, "Select the edges the panel line should follow.")
+            return {'CANCELLED'}
+
+        vertices, faces, runs = [], [], 0
+        for chain, closed in ordered_paths(pairs):
+            frames = list(sweep_frames([positions[index] for index in chain],
+                                       [normals[index] for index in chain], closed))
+            part_vertices, part_faces = panel_tube_geometry(
+                frames, closed, self.width, self.depth, self.overshoot)
+            if not part_faces:
+                continue
+
+            offset = len(vertices)
+            vertices.extend(part_vertices)
+            faces.extend(tuple(index + offset for index in face) for face in part_faces)
+            runs += 1
+
+        if not faces:
+            self.report({'ERROR'}, "Selected edges do not form a usable path.")
+            return {'CANCELLED'}
+
+        cutter = self.build_cutter(context, source, vertices, faces)
+        add_boolean(source, cutter, 'DIFFERENCE', f"Bool_Panel_{cutter.name}", self)
+        stash_operand(context, cutter)
+
+        note = " Tab out to see it." if context.mode == 'EDIT_MESH' else ""
+        self.report({'INFO'}, f"Panel line cut along {runs} run(s).{note}")
+        return {'FINISHED'}
+
+    @staticmethod
+    def read_selection(context, source):
+        """Selected edges as index pairs, plus each vertex's position and normal.
+
+        Works from either mode: edge selection persists in mesh data after
+        leaving Edit Mode, and running from Object Mode keeps object creation
+        out of the edit-mode undo stack.
+        """
+        pairs, positions, normals = [], {}, {}
+
+        if context.mode == 'EDIT_MESH':
+            bm = bmesh.from_edit_mesh(source.data)
+            bm.normal_update()
+            for edge in bm.edges:
+                if not edge.select:
+                    continue
+                first, second = edge.verts
+                pairs.append((first.index, second.index))
+                for vertex in (first, second):
+                    positions[vertex.index] = vertex.co.copy()
+                    normals[vertex.index] = vertex.normal.copy()
+        else:
+            mesh = source.data
+            for edge in mesh.edges:
+                if not edge.select:
+                    continue
+                first, second = edge.vertices
+                pairs.append((first, second))
+                for index in (first, second):
+                    positions[index] = mesh.vertices[index].co.copy()
+                    normals[index] = mesh.vertices[index].normal.copy()
+
+        return pairs, positions, normals
+
+    @staticmethod
+    def build_cutter(context, source, vertices, faces):
+        """A closed mesh tube, built in the source's local space.
+
+        The cutter is a mesh rather than a curve because Blender's Boolean
+        modifier only accepts mesh operands, so a curve cutter cannot drive the
+        cut however good it looks in the viewport.
+        """
+        mesh = bpy.data.meshes.new(f"PanelLine_{source.name}")
+        mesh.from_pydata([tuple(vertex) for vertex in vertices], [], faces)
+        mesh.update()
+
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+        bm.to_mesh(mesh)
+        bm.free()
+
+        cutter = bpy.data.objects.new(mesh.name, mesh)
+        context.scene.collection.objects.link(cutter)
+        cutter.matrix_world = source.matrix_world
+        return cutter
+
+
+# --- SHADING ------------------------------------------------------------------
 
 class OBJECT_OT_smart_bevel(bpy.types.Operator):
     """Applies Hard-Surface Bevel and Weighted Normals"""
@@ -112,46 +2325,337 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
 
     bevel_width: FloatProperty(name="Bevel Width", default=0.01, min=0.001, step=0.1)
     bevel_segments: IntProperty(name="Segments", default=3, min=1, max=10)
+    sharp_angle: FloatProperty(name="Sharp Angle", default=0.523599, subtype='ANGLE')
+    limit_mode: EnumProperty(
+        name="Limit",
+        items=[
+            ('WEIGHT', "Weight", "Bevel edges by their bevel weight, so each edge "
+                                 "can be dialled or excluded on its own"),
+            ('ANGLE', "Angle", "Bevel every edge sharper than the threshold, the "
+                               "same amount everywhere"),
+        ],
+        default='WEIGHT',
+    )
+    mark_sharp: BoolProperty(
+        name="Auto-Mark Sharp",
+        description="Rebuild sharp edges from the angle threshold (overwrites manual sharps)",
+        default=True,
+    )
+    reseed_weights: BoolProperty(
+        name="Re-seed Weights",
+        description="Rewrite every bevel weight from the angle threshold. Off by "
+                    "default: weights are seeded once so the result matches Angle "
+                    "mode, and hand-dialled edges survive later runs",
+        default=False,
+    )
+    vertex_bevel: BoolProperty(
+        name="Vertex Bevel",
+        description="Add a second bevel that rounds corners. It is weight-driven, "
+                    "so it does nothing until vertices are given a weight",
+        default=False,
+    )
+    vertex_width: FloatProperty(name="Vertex Width", default=0.01, min=0.0001, step=0.1,
+                                subtype='DISTANCE')
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == 'MESH'
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
 
     def execute(self, context):
-        for obj in context.selected_objects:
-            if obj.type != 'MESH': continue
+        meshes = selected_meshes(context)
+        if not meshes:
+            self.report({'ERROR'}, "Select at least one mesh.")
+            return {'CANCELLED'}
 
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-            bpy.ops.object.shade_smooth()
-            
-            if hasattr(obj.data, "use_auto_smooth"):
-                obj.data.use_auto_smooth = True
-                obj.data.auto_smooth_angle = 1.0472
-            
-            mod_bevel = obj.modifiers.get("Smart_Bevel")
-            if not mod_bevel:
-                mod_bevel = obj.modifiers.new(name="Smart_Bevel", type='BEVEL')
-            
-            mod_bevel.limit_method = 'ANGLE'
-            mod_bevel.angle_limit = 0.523599
-            mod_bevel.width = self.bevel_width
-            mod_bevel.segments = self.bevel_segments
-            mod_bevel.profile = 0.7
-            mod_bevel.miter_outer = 'MITER_ARC'
+        seeded = 0
+        for obj in meshes:
+            if self.shade(obj.data):
+                seeded += 1
+            self.build_stack(obj)
 
-            mod_wn = obj.modifiers.get("Smart_Weighted_Normal")
-            if not mod_wn:
-                mod_wn = obj.modifiers.new(name="Smart_Weighted_Normal", type='WEIGHTED_NORMAL')
-            mod_wn.keep_sharp = True
+        note = f", seeded weights on {seeded}" if seeded else ""
+        self.report({'INFO'}, f"Smart Bevel on {len(meshes)} object(s)"
+                              f" in {self.limit_mode.lower()} mode{note}.")
+        return {'FINISHED'}
 
-        for obj in context.selected_objects: obj.select_set(True)
-        self.report({'INFO'}, "Applied Smart Bevel & Normals.")
+    def shade(self, mesh):
+        """Smooth-shade the mesh, rebuild sharp edges, and seed bevel weights.
+
+        Written against mesh data rather than bpy.ops.object.shade_smooth() so it
+        never touches the user's selection, and so it does not depend on the
+        pre-4.1 use_auto_smooth flag (removed in Blender 4.1).
+
+        Weights are seeded from the same angle test the old Angle mode used, so
+        switching costs nothing visually, and only when they do not already
+        exist. Re-running would otherwise flatten every edge the artist had
+        dialled by hand, which is the whole point of weight mode.
+        """
+        mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+
+        seed = (self.limit_mode == 'WEIGHT'
+                and (self.reseed_weights
+                     or mesh.attributes.get(EDGE_WEIGHT_ATTR) is None))
+        if not (self.mark_sharp or seed):
+            mesh.update()
+            return False
+
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        weights = bevel_weight_layer(bm, 'EDGE') if seed else None
+
+        for edge in bm.edges:
+            sharp = edge.calc_face_angle(0.0) >= self.sharp_angle
+            if self.mark_sharp:
+                edge.smooth = not sharp
+            if weights is not None:
+                edge[weights] = 1.0 if sharp else 0.0
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+        return seed
+
+    def build_stack(self, obj):
+        bevel = obj.modifiers.get(BEVEL_MOD) or obj.modifiers.new(name=BEVEL_MOD, type='BEVEL')
+        bevel.limit_method = self.limit_mode
+        bevel.angle_limit = self.sharp_angle
+        bevel.segments = self.bevel_segments
+        bevel.profile = 0.7
+        bevel.miter_outer = 'MITER_ARC'
+        tune_bevel(bevel, self.bevel_width)
+        if hasattr(bevel, "edge_weight"):
+            bevel.edge_weight = EDGE_WEIGHT_ATTR
+
+        existing = obj.modifiers.get(VERTEX_BEVEL_MOD)
+        if self.vertex_bevel:
+            corner = existing or obj.modifiers.new(name=VERTEX_BEVEL_MOD, type='BEVEL')
+            corner.affect = 'VERTICES'
+            # Weight driven rather than every corner: bevelling all of them at
+            # once is almost never what a hard-surface piece wants.
+            corner.limit_method = 'WEIGHT'
+            corner.segments = self.bevel_segments
+            tune_bevel(corner, self.vertex_width)
+            if hasattr(corner, "vertex_weight"):
+                corner.vertex_weight = VERT_WEIGHT_ATTR
+        elif existing is not None:
+            obj.modifiers.remove(existing)
+
+        weighted_normal = (obj.modifiers.get(WEIGHTED_NORMAL_MOD)
+                           or obj.modifiers.new(name=WEIGHTED_NORMAL_MOD, type='WEIGHTED_NORMAL'))
+        weighted_normal.keep_sharp = True
+        # Pairs with the bevels' face strength: the narrow bevel strips are
+        # marked weak, so the wide flat faces around them decide the normal.
+        # Measured on a cube with a raised inset panel, this took the mesh from
+        # 97 distinct loop normals to 57 -- the strips stop dragging the flat
+        # faces out of true, which is the usual cause of smeared edge shading.
+        if hasattr(weighted_normal, "use_face_influence"):
+            weighted_normal.use_face_influence = True
+
+        # Keeps weld -> vertex bevel -> bevel -> weighted normal in order at the
+        # tail, after every boolean, however the user built the stack up.
+        sort_post_boolean_stack(obj)
+
+
+class MESH_OT_set_bevel_weight(bpy.types.Operator):
+    """Set the bevel weight on the selected edges or vertices"""
+    bl_idname = "mesh.set_bevel_weight"
+    bl_label = "Set Bevel Weight"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    weight: FloatProperty(
+        name="Weight",
+        description="1 bevels at the modifier's full width, 0 excludes the edge, "
+                    "and anything between scales the width for a variable fillet",
+        default=1.0, min=0.0, max=1.0, precision=3,
+    )
+    domain: EnumProperty(
+        name="Apply To",
+        items=[('EDGE', "Edges", "Drive the edge bevel"),
+               ('VERTEX', "Vertices", "Drive the vertex bevel")],
+        default='EDGE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH' and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bevel_weight_layer(bm, self.domain)
+
+        elements = bm.edges if self.domain == 'EDGE' else bm.verts
+        touched = 0
+        for element in elements:
+            if element.select:
+                element[layer] = self.weight
+                touched += 1
+
+        if not touched:
+            self.report({'WARNING'}, "Nothing selected.")
+            return {'CANCELLED'}
+
+        bmesh.update_edit_mesh(obj.data)
+        self.report({'INFO'}, f"Weight {self.weight:.2f} on {touched} "
+                              f"{self.domain.lower()}(s).")
         return {'FINISHED'}
 
 
-# --- NEW SMART UV CLASSES ---
+class MESH_OT_add_bevel_layer(bpy.types.Operator):
+    """Give the selected edges a bevel of their own, at their own width"""
+    bl_idname = "mesh.add_bevel_layer"
+    bl_label = "Bevel Selection Separately"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    width: FloatProperty(name="Width", default=0.01, min=0.0001, step=0.1,
+                         subtype='DISTANCE',
+                         description="Width of the chamfer strip itself")
+    segments: IntProperty(name="Segments", default=3, min=1, max=24)
+    profile: FloatProperty(name="Profile", default=0.7, min=0.0, max=1.0)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (context.mode == 'EDIT_MESH' and obj is not None
+                and obj.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected = [edge.index for edge in bm.edges if edge.select]
+        if not selected:
+            self.report({'ERROR'}, "Select the edges this bevel should affect.")
+            return {'CANCELLED'}
+
+        # Attributes cannot be added to a mesh that is open for editing, so the
+        # write happens in Object Mode. Indices stay valid across the hop
+        # because no topology changes in between.
+        bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            attribute = obj.data.attributes.new(BEVEL_LAYER_ATTR, 'FLOAT', 'EDGE')
+            for index in selected:
+                attribute.data[index].value = 1.0
+
+            bevel = obj.modifiers.new(name=BEVEL_LAYER_MOD, type='BEVEL')
+            bevel.limit_method = 'WEIGHT'
+            bevel.edge_weight = attribute.name
+            bevel.segments = self.segments
+            bevel.profile = self.profile
+            bevel.miter_outer = 'MITER_ARC'
+            tune_bevel(bevel, self.width)
+            sort_post_boolean_stack(obj)
+        finally:
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        self.report({'INFO'}, f"{bevel.name} on {len(selected)} edge(s).")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_remove_bevel_layer(bpy.types.Operator):
+    """Delete this bevel layer and the edge attribute that drives it"""
+    bl_idname = "object.remove_bevel_layer"
+    bl_label = "Remove Bevel Layer"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    modifier_name: StringProperty(name="Modifier")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        modifier = obj.modifiers.get(self.modifier_name)
+        if modifier is None or not is_bevel_layer(modifier):
+            self.report({'ERROR'}, f"No bevel layer named {self.modifier_name}.")
+            return {'CANCELLED'}
+
+        # The attribute goes with it. Leaving it behind would quietly grow the
+        # mesh a dead float per edge for every layer ever removed.
+        attribute = layer_attribute(obj, modifier)
+        obj.modifiers.remove(modifier)
+        if attribute is not None:
+            obj.data.attributes.remove(attribute)
+
+        self.report({'INFO'}, f"Removed {self.modifier_name}.")
+        return {'FINISHED'}
+
+
+class MESH_OT_assign_bevel_layer(bpy.types.Operator):
+    """Add or remove the selected edges from an existing bevel layer"""
+    bl_idname = "mesh.assign_bevel_layer"
+    bl_label = "Assign To Bevel Layer"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    modifier_name: StringProperty(name="Modifier")
+    remove: BoolProperty(name="Remove", default=False)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (context.mode == 'EDIT_MESH' and obj is not None
+                and obj.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+        modifier = obj.modifiers.get(self.modifier_name)
+        if modifier is None or not is_bevel_layer(modifier):
+            self.report({'ERROR'}, f"No bevel layer named {self.modifier_name}.")
+            return {'CANCELLED'}
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected = [edge.index for edge in bm.edges if edge.select]
+        if not selected:
+            self.report({'ERROR'}, "Nothing selected.")
+            return {'CANCELLED'}
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            attribute = layer_attribute(obj, modifier)
+            if attribute is None:
+                self.report({'ERROR'},
+                            f"{self.modifier_name} has lost its edge attribute.")
+                return {'CANCELLED'}
+            value = 0.0 if self.remove else 1.0
+            for index in selected:
+                attribute.data[index].value = value
+        finally:
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        verb = "Removed" if self.remove else "Added"
+        self.report({'INFO'}, f"{verb} {len(selected)} edge(s).")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_apply_bevel_resolution(bpy.types.Operator):
+    """Push the current bevel resolution onto every targeted Smart Bevel"""
+    bl_idname = "object.apply_bevel_resolution"
+    bl_label = "Apply Resolution"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT'
+
+    def execute(self, context):
+        # The slider updates live as it is dragged, so this is for after the
+        # selection changes or new objects arrive without the slider moving.
+        count = apply_bevel_resolution(context.scene, context.view_layer)
+        if not count:
+            self.report({'WARNING'}, "No Smart Bevel modifiers in range.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Set {count} Smart Bevel(s) to "
+                              f"{context.scene.smart_bevel_segments} segment(s).")
+        return {'FINISHED'}
+
+
+# --- UV -----------------------------------------------------------------------
 
 class OBJECT_OT_smart_uv(bpy.types.Operator):
     """Auto-mark seams by angle and unwrap"""
@@ -159,153 +2663,1183 @@ class OBJECT_OT_smart_uv(bpy.types.Operator):
     bl_label = "Smart UV Unwrap"
     bl_options = {'REGISTER', 'UNDO'}
 
-    # Properties adjustable in the F9 menu
-    angle_limit: FloatProperty(name="Sharp Angle", default=0.523599, subtype='ANGLE') # 30 degrees
+    angle_limit: FloatProperty(name="Sharp Angle", default=0.523599, subtype='ANGLE')
     island_margin: FloatProperty(name="Margin", default=0.02, min=0.001, max=1.0)
+    clear_seams: BoolProperty(
+        name="Clear Existing Seams",
+        description="Discard every seam on the mesh before marking new ones",
+        default=False,
+    )
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == 'MESH'
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
 
     def execute(self, context):
-        obj = context.active_object
-        
-        # Save current mode so we can return to it smoothly
-        original_mode = obj.mode
-        if original_mode != 'EDIT':
-            bpy.ops.object.mode_set(mode='EDIT')
-        
-        # 1. Clear the slate
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.mark_seam(clear=True)
-        bpy.ops.mesh.select_all(action='DESELECT')
-        
-        # 2. Find sharp edges and mark them
-        bpy.ops.mesh.edges_select_sharp(sharpness=self.angle_limit)
-        bpy.ops.mesh.mark_seam(clear=False)
-        
-        # 3. Select everything and Unwrap
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=self.island_margin)
-        
-        # Return to user's original mode
-        bpy.ops.object.mode_set(mode=original_mode)
-        
-        self.report({'INFO'}, f"Smart UV Unwrapped with {self.island_margin} margin.")
+        meshes = selected_meshes(context)
+        if not meshes:
+            self.report({'ERROR'}, "Select at least one mesh.")
+            return {'CANCELLED'}
+
+        for obj in meshes:
+            auto_unwrap(context, obj, self.angle_limit, self.island_margin, self.clear_seams)
+
+        self.report({'INFO'}, f"Unwrapped {len(meshes)} object(s). Booleans are not applied here "
+                              "- the exporter unwraps the evaluated mesh.")
         return {'FINISHED'}
 
 
-# --- EXISTING UE5 EXPORT PIPELINE ---
+class OBJECT_OT_preflight_scan(bpy.types.Operator):
+    """Check and clean a mesh before it goes to the engine"""
+    bl_idname = "object.preflight_scan"
+    bl_label = "Scan & Sanitize"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    report_only: BoolProperty(
+        name="Report Only",
+        description="Measure the mesh without touching it. Worth a first pass on "
+                    "a finished asset before anything is allowed to change it",
+        default=False,
+    )
+    merge_distance: FloatProperty(
+        name="Merge Distance",
+        description="Vertices closer than this are welded, and edges shorter "
+                    "than this are dissolved",
+        default=0.0001, min=0.0, max=0.1, precision=5, step=0.001, subtype='DISTANCE',
+    )
+    remove_loose: BoolProperty(name="Remove Loose Geometry", default=True)
+    remove_interior: BoolProperty(name="Remove Interior Faces", default=True)
+    triangulate_curved: BoolProperty(
+        name="Triangulate Curved Ngons",
+        description="Triangulate only the ngons that bend. Flat ngons are left "
+                    "whole: an engine triangulates those the same way whatever "
+                    "it does, and keeping them keeps the wireframe readable",
+        default=True,
+    )
+    planar_tolerance: FloatProperty(
+        name="Flatness Tolerance",
+        description="How far a face may bend, relative to its size, and still "
+                    "count as flat",
+        default=0.0001, min=0.0, max=1.0, precision=6, step=0.01,
+    )
+    include_quads: BoolProperty(
+        name="Include Quads",
+        description="Also triangulate quads that bend. Off by default: a warped "
+                    "quad is far more common than a warped ngon and turning them "
+                    "all into triangles doubles the count for little gain",
+        default=False,
+    )
+    select_issues: BoolProperty(
+        name="Select What Is Left",
+        description="Select any holes and non-manifold seams that survived and "
+                    "drop into Edit Mode to look at them",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
+
+    def execute(self, context):
+        meshes = selected_meshes(context)
+        if not meshes:
+            self.report({'ERROR'}, "Select at least one mesh.")
+            return {'CANCELLED'}
+
+        totals = {}
+        remaining = {}
+        for obj in meshes:
+            if obj.data.users > 1:
+                self.report({'WARNING'}, f"Skipped {obj.name}: mesh data is shared.")
+                continue
+            for key, value in self.process(obj).items():
+                target = remaining if key.startswith("left_") else totals
+                target[key] = target.get(key, 0) + value
+
+        summary = self.describe(totals, remaining)
+        for obj in meshes:
+            obj["preflight_report"] = summary
+
+        blocked = sum(remaining.values())
+        if blocked and self.select_issues and not self.report_only:
+            bpy.ops.object.mode_set(mode='EDIT')
+            context.tool_settings.mesh_select_mode = (False, True, False)
+
+        self.report({'WARNING'} if blocked else {'INFO'}, summary)
+        return {'FINISHED'}
+
+    def process(self, obj):
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+
+        counts = {}
+        if self.report_only:
+            found = diagnose_mesh(bm, self.planar_tolerance, self.include_quads)
+            counts.update({
+                "loose_verts": len(found["loose_verts"]),
+                "interior_faces": len(found["interior_faces"]),
+                "triangulated": len(found["curved_ngons"]),
+                "welded_verts": 0,
+            })
+        else:
+            counts.update(sanitize_mesh(
+                bm, self.merge_distance, True, self.remove_loose,
+                self.remove_interior, self.triangulate_curved,
+                self.planar_tolerance, self.include_quads))
+
+        # What survived is what a person has to look at: an open hole cannot be
+        # closed safely without knowing what the asset is meant to be.
+        left = diagnose_mesh(bm, self.planar_tolerance, self.include_quads)
+        counts["left_holes"] = len(left["holes"])
+        counts["left_junctions"] = len(left["junctions"])
+
+        if self.select_issues and not self.report_only:
+            for element in bm.verts, bm.edges, bm.faces:
+                for item in element:
+                    item.select_set(False)
+            for edge in left["holes"] + left["junctions"]:
+                edge.select_set(True)
+
+        if not self.report_only:
+            bm.to_mesh(obj.data)
+            obj.data.update()
+        bm.free()
+        return counts
+
+    @staticmethod
+    def describe(totals, remaining):
+        parts = []
+        labels = (("welded_verts", "welded"), ("loose_verts", "loose"),
+                  ("interior_faces", "interior faces"), ("triangulated", "ngons split"))
+        for key, label in labels:
+            if totals.get(key):
+                parts.append(f"{totals[key]} {label}")
+
+        blockers = []
+        if remaining.get("left_holes"):
+            blockers.append(f"{remaining['left_holes']} open edges")
+        if remaining.get("left_junctions"):
+            blockers.append(f"{remaining['left_junctions']} non-manifold seams")
+
+        if blockers:
+            return (", ".join(parts) + " | " if parts else "") + \
+                   "needs a look: " + ", ".join(blockers)
+        return ", ".join(parts) if parts else "Clean"
+
+
+class OBJECT_OT_add_collision_box(bpy.types.Operator):
+    """Add a box over the active mesh, ready to shape into a collision hull"""
+    bl_idname = "object.add_collision_box"
+    bl_label = "Add Hull Box"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    coverage: FloatProperty(
+        name="Coverage",
+        description="Size of the box as a fraction of the mesh's bounds. A "
+                    "concave shape needs several smaller boxes, so start under 1",
+        default=1.0, min=0.05, max=1.0, precision=2, step=5.0,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        return (context.mode == 'OBJECT' and active is not None
+                and active.type == 'MESH' and not is_collision(active))
+
+    def execute(self, context):
+        target = context.active_object
+        low, high = mesh_bounds(target.data, target.matrix_world)
+        if low is None:
+            self.report({'ERROR'}, f"{target.name} has no geometry to measure.")
+            return {'CANCELLED'}
+
+        centre = (low + high) * 0.5
+        size = (high - low) * self.coverage
+        # A flat mesh would give a zero-thickness box, which is no use as a hull.
+        size = Vector((max(size.x, 1e-4), max(size.y, 1e-4), max(size.z, 1e-4)))
+
+        mesh = bpy.data.meshes.new("HullBox")
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=1.0)
+        bm.to_mesh(mesh)
+        bm.free()
+
+        box = bpy.data.objects.new("HullBox", mesh)
+        context.scene.collection.objects.link(box)
+        box.matrix_world = Matrix.Translation(centre) @ Matrix.Diagonal(
+            size.to_4d())
+        # Wireframe from the start so it does not hide the mesh being covered.
+        box.display_type = 'WIRE'
+
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        box.select_set(True)
+        context.view_layer.objects.active = box
+
+        self.report({'INFO'}, "Hull box added. Shape it, then select it plus the "
+                              "mesh (mesh last) and press Generate UCX.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_generate_ucx(bpy.types.Operator):
+    """Turn the selected boxes into collision hulls for the active mesh"""
+    bl_idname = "object.generate_ucx"
+    bl_label = "Generate UCX"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    display_as: EnumProperty(
+        name="Display",
+        items=[('WIRE', "Wireframe", "Show the hull as a wireframe cage"),
+               ('BOUNDS', "Bounds", "Show only the hull's bounding box")],
+        default='WIRE',
+    )
+    match_export_name: BoolProperty(
+        name="Match Export Name",
+        description="Name the hulls after the mesh name the exporter will write, "
+                    "which is what Unreal matches against. Turn it off for the "
+                    "shorter bare asset name, which reads better in the outliner",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        return (context.mode == 'OBJECT' and active is not None
+                and active.type == 'MESH' and len(context.selected_objects) >= 2)
+
+    def execute(self, context):
+        target = context.active_object
+        picked = [obj for obj in context.selected_objects
+                  if obj is not target and obj.type == 'MESH']
+        if not picked:
+            self.report({'ERROR'}, "Select the hulls, then the render mesh last.")
+            return {'CANCELLED'}
+
+        # Hulls already attached are renumbered alongside the new ones, so
+        # adding a sixth box to a set of five does not collide with UCX_..._01.
+        existing = [hull for hull in collision_hulls(target) if hull not in picked]
+        hulls = existing + picked
+
+        base = (export_asset_name(target.name, 'LOW') if self.match_export_name
+                else strip_asset_affixes(target.name))
+
+        # Two passes: Blender appends .001 to a name already in use, so every
+        # hull is parked on a placeholder before the real names are handed out.
+        for index, hull in enumerate(hulls):
+            hull.name = f"__ucx_pending_{index}"
+
+        for index, hull in enumerate(hulls, start=1):
+            name = f"UCX_{base}_{index:02d}"
+            hull.name = name
+            hull.data.name = name
+            hull.display_type = self.display_as
+            hull.hide_render = True
+
+            if hull.parent is not target:
+                # Parent inverse cancels the target's current matrix, so the
+                # hull does not jump when it is attached.
+                hull.parent = target
+                hull.matrix_parent_inverse = target.matrix_world.inverted_safe()
+
+        self.report({'INFO'}, f"{len(hulls)} hull(s) named UCX_{base}_01..{len(hulls):02d} "
+                              f"and parented to {target.name}.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_smart_triangulate(bpy.types.Operator):
+    """Freeze the mesh into triangles the way an engine will read it"""
+    bl_idname = "object.smart_triangulate"
+    bl_label = "Triangulate for Engine"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Mode",
+        items=[
+            ('MODIFIER', "Non-Destructive", "Add a Triangulate modifier at the end "
+                                            "of the stack, leaving the base mesh editable"),
+            ('APPLY', "Bake Ready", "Apply the whole stack and write triangles into "
+                                    "the mesh data"),
+        ],
+        default='MODIFIER',
+    )
+    quad_method: EnumProperty(name="Quads", items=QUAD_METHODS, default='SHORTEST_DIAGONAL')
+    ngon_method: EnumProperty(name="Ngons", items=NGON_METHODS, default='BEAUTY')
+    ngon_only: BoolProperty(
+        name="Ngons Only",
+        description="Leave quads whole and split only faces with five or more "
+                    "sides, for a wireframe that still reads in a portfolio shot",
+        default=False,
+    )
+    keep_custom_normals: BoolProperty(
+        name="Keep Custom Normals",
+        description="Carry the split normals the bevel and weighted normal built "
+                    "through the split. Blender leaves this off by default, which "
+                    "is what silently flattens the edge shading",
+        default=True,
+    )
+    keep_original: BoolProperty(
+        name="Keep Original",
+        description="Bake Ready only: leave the editable version behind as a copy",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "mode")
+        layout.prop(self, "quad_method")
+        layout.prop(self, "ngon_method")
+        layout.prop(self, "ngon_only")
+        layout.prop(self, "keep_custom_normals")
+        if self.mode == 'APPLY':
+            layout.prop(self, "keep_original")
+
+    def execute(self, context):
+        meshes = selected_meshes(context)
+        if not meshes:
+            self.report({'ERROR'}, "Select at least one mesh.")
+            return {'CANCELLED'}
+
+        if self.mode == 'MODIFIER':
+            for obj in meshes:
+                ensure_triangulation(obj, self.quad_method, self.ngon_method,
+                                     self.ngon_only, self.keep_custom_normals)
+            self.report({'INFO'}, f"Triangulate modifier on {len(meshes)} object(s), "
+                                  f"{self.quad_method.replace('_', ' ').lower()}.")
+            return {'FINISHED'}
+
+        shared = [obj.name for obj in meshes if obj.data.users > 1]
+        baked = 0
+        for obj in meshes:
+            if obj.data.users > 1:
+                continue
+            ensure_triangulation(obj, self.quad_method, self.ngon_method,
+                                 self.ngon_only, self.keep_custom_normals)
+            with sole_active(context, obj):
+                # convert() walks the whole stack in order, so the custom
+                # normals the weighted normal produces are still present when
+                # the triangulate modifier consumes them. Triangulating the mesh
+                # data directly would throw them away.
+                bpy.ops.object.convert(target='MESH', keep_original=self.keep_original)
+            baked += 1
+
+        if shared:
+            self.report({'WARNING'},
+                        f"Skipped {len(shared)} object(s) with shared mesh data: "
+                        f"{', '.join(shared[:3])}")
+        if not baked:
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Baked {baked} object(s) to triangles.")
+        return {'FINISHED'}
+
+
+# --- UE5 EXPORT PIPELINE -------------------------------------------------------
 
 class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
     """Export selected meshes as UE5-ready FBX files"""
     bl_idname = "object.smart_export_ue5"
     bl_label = "Export to UE5"
-    
+    bl_options = {'REGISTER'}
+
+    # Only export_type is an operator property: it is set by the panel button.
+    # The rest live on the scene because this operator has no UNDO, so Blender
+    # never shows an adjust-last-operation panel for it.
     export_type: EnumProperty(
         name="Export Type",
-        items=[('LOW', "Low Poly (_low)", ""), ('HIGH', "High Poly (_high)", "")]
+        items=[('LOW', "Low Poly (_low)", ""), ('HIGH', "High Poly (_high)", "")],
+        default='LOW',
     )
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None
+        return context.mode == 'OBJECT' and any(
+            obj.type in EXPORTABLE_TYPES for obj in context.selected_objects
+        )
 
     def execute(self, context):
-        export_dir = context.scene.smart_export_path
-        if not export_dir or not os.path.isdir(bpy.path.abspath(export_dir)):
+        scene = context.scene
+        export_dir = bpy.path.abspath(scene.smart_export_path) if scene.smart_export_path else ""
+        if not export_dir or not os.path.isdir(export_dir):
             self.report({'ERROR'}, "Please set a valid Export Directory first.")
             return {'CANCELLED'}
 
-        base_name = context.active_object.name
-        if base_name.startswith("SM_"): base_name = base_name[3:]
-        if base_name.endswith("_high"): base_name = base_name[:-5]
-        if base_name.endswith("_low"): base_name = base_name[:-4]
+        unit_scale = scene.unit_settings.scale_length
+        if abs(unit_scale - 1.0) > 1e-6:
+            self.report({'WARNING'},
+                        f"Scene Unit Scale is {unit_scale:g}; UE5 expects 1.0. "
+                        "Sizes in Unreal will not match Blender.")
 
-        suffix = "_high" if self.export_type == 'HIGH' else "_low"
-        final_name = f"SM_{base_name}{suffix}"
-        
-        filepath = os.path.join(bpy.path.abspath(export_dir), f"{final_name}.fbx")
+        sources = selected_exportable(context)
+        if not sources:
+            self.report({'ERROR'}, "Select at least one mesh or curve to export.")
+            return {'CANCELLED'}
 
-        bpy.ops.export_scene.fbx(
-            filepath=filepath,
-            use_selection=True,                     
-            apply_scale_options='FBX_SCALE_ALL',    
-            mesh_smooth_type='FACE',                
-            add_leaf_bones=False,                   
-            use_armature_deform_only=True,
-            bake_anim=False                         
-        )
+        written = 0
+        cleaned_verts = 0
+        cleaned_faces = 0
+        leaky = []
+        collision = 0
+        for source in sources:
+            name = self.asset_name(source.name)
+            # Held open across the teardown below: the originals cannot take
+            # their names back until the copies using them have been removed.
+            # Captured before the names are released: collision is identified by
+            # its UCX_ prefix, which the release temporarily takes away.
+            source_hulls = collision_hulls(source)
+            with names_released([source] + source_hulls):
+                temp, shift = self.build_export_copy(context, source, name,
+                                                     scene.smart_export_origin)
+                hulls = self.build_collision_copies(context, source_hulls, name, shift)
+                # A duplicate suffix here means something still held the name.
+                # It is silent in Blender and fatal in Unreal, which matches
+                # collision by exact name, so it fails loudly instead.
+                mangled = [obj.name for obj in [temp] + hulls if "." in obj.name]
+                if mangled:
+                    for hull in hulls:
+                        bpy.data.objects.remove(hull, do_unlink=True)
+                    bpy.data.objects.remove(temp, do_unlink=True)
+                    self.report({'ERROR'},
+                                f"Name collision on export: {', '.join(mangled)}. "
+                                "Nothing was written.")
+                    return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Exported: {final_name}.fbx")
+                verts, faces = self.export_one(context, scene, source, temp, hulls,
+                                               name, export_dir, leaky)
+                cleaned_verts += verts
+                cleaned_faces += faces
+                written += 1
+                collision += len(hulls)
+        summary = f"Exported {written} FBX file(s) to {export_dir}"
+        if collision:
+            summary += f" with {collision} collision hull(s)"
+        if cleaned_verts or cleaned_faces:
+            summary += f" (removed {cleaned_verts} vertices, {cleaned_faces} faces)"
+        self.report({'INFO'}, summary)
         return {'FINISHED'}
 
+    def export_one(self, context, scene, source, temp, hulls, name, export_dir, leaky):
+        """Prepare and write one render mesh together with its collision."""
+        cleaned_verts = cleaned_faces = 0
+        try:
+            # Clean before unwrapping: the UVs must describe the final mesh.
+            if scene.smart_export_clean:
+                cleaned_verts, cleaned_faces, open_edges = clean_mesh(
+                    context, temp,
+                    scene.smart_export_merge_distance,
+                    scene.smart_export_remove_interior)
+                if open_edges:
+                    leaky.append(f"{source.name} ({open_edges})")
+
+            # High poly is a bake source only, so it never needs UVs. A curve
+            # already carries the straight strip UV Blender generates for it,
+            # which is exactly what a cable wants; re-unwrapping by angle would
+            # throw that away.
+            if (self.export_type == 'LOW' and scene.smart_export_unwrap
+                    and source.type == 'MESH'):
+                auto_unwrap(context, temp, scene.smart_export_seam_angle,
+                            scene.smart_export_margin, True)
+
+            # Freeze triangles on the copy that is actually written, so the
+            # baker and the engine cannot each choose their own split.
+            if scene.smart_export_triangulate:
+                ensure_triangulation(temp, scene.smart_export_quad_method,
+                                     'BEAUTY', False, True)
+
+            self.write_fbx(context, temp, os.path.join(export_dir, f"{name}.fbx"),
+                           also=hulls)
+        finally:
+            for hull in hulls:
+                hull_mesh = hull.data
+                bpy.data.objects.remove(hull, do_unlink=True)
+                bpy.data.meshes.remove(hull_mesh)
+            mesh = temp.data
+            bpy.data.objects.remove(temp, do_unlink=True)
+            bpy.data.meshes.remove(mesh)
+
+        return cleaned_verts, cleaned_faces
+
+    def asset_name(self, raw_name):
+        return export_asset_name(raw_name, self.export_type)
+
+    def build_export_copy(self, context, source, name, origin_mode):
+        """Build a throwaway object holding the fully evaluated mesh.
+
+        Exporting a copy rather than the live object means booleans and bevels
+        are real geometry before the UVs are generated, and lets rotation and
+        scale be baked in so the FBX carries a clean transform.
+        """
+        with bevels_at_render_visibility((source,)):
+            depsgraph = context.evaluated_depsgraph_get()
+            mesh = bpy.data.meshes.new_from_object(
+                source.evaluated_get(depsgraph),
+                preserve_all_data_layers=True,
+                depsgraph=depsgraph,
+            )
+        mesh.name = name
+
+        temp = bpy.data.objects.new(name, mesh)
+        context.scene.collection.objects.link(temp)
+
+        # Bake rotation and scale into the mesh, leaving translation on the object.
+        location = source.matrix_world.translation.copy()
+        mesh.transform(Matrix.Translation(-location) @ source.matrix_world)
+        if source.matrix_world.determinant() < 0.0:
+            # Mirrored objects come out inside-out once the transform is baked.
+            mesh.flip_normals()
+        temp.matrix_world = Matrix.Translation(location)
+
+        # Whatever the origin mode shifts the render mesh by, the collision has
+        # to move by the same amount or it lands somewhere else in the engine.
+        shift = Matrix.Identity(4)
+        if origin_mode == 'WORLD':
+            temp.matrix_world = Matrix.Identity(4)
+            shift = Matrix.Translation(-location)
+        elif origin_mode == 'BOTTOM':
+            offset = self.recentre_on_bounds(mesh)
+            temp.matrix_world = Matrix.Identity(4)
+            shift = Matrix.Translation(-location - offset)
+
+        return temp, shift
+
+    @staticmethod
+    def recentre_on_bounds(mesh):
+        low, high = mesh_bounds(mesh, Matrix.Identity(4))
+        if low is None:
+            return Vector((0.0, 0.0, 0.0))
+        offset = bottom_centre(low, high)
+        mesh.transform(Matrix.Translation(-offset))
+        return offset
+
+    @staticmethod
+    def build_collision_copies(context, source_hulls, render_name, shift):
+        """Copies of the render mesh's collision hulls, renamed to bind to it.
+
+        Unreal matches collision to a render mesh by the name inside the FBX, so
+        the hulls are renamed from the same string the render mesh was named
+        from. Deriving both from one value is what makes the match impossible to
+        get wrong, whatever the objects happen to be called in Blender.
+        """
+        depsgraph = context.evaluated_depsgraph_get()
+        copies = []
+        for index, hull in enumerate(source_hulls, start=1):
+            mesh = bpy.data.meshes.new_from_object(
+                hull.evaluated_get(depsgraph), preserve_all_data_layers=True,
+                depsgraph=depsgraph)
+            name = f"UCX_{render_name}_{index:02d}"
+            mesh.name = name
+
+            copy = bpy.data.objects.new(name, mesh)
+            context.scene.collection.objects.link(copy)
+            # Bake the hull's own transform, then apply the render mesh's shift.
+            mesh.transform(hull.matrix_world)
+            copy.matrix_world = shift
+            copies.append(copy)
+        return copies
+
+    @staticmethod
+    def write_fbx(context, obj, filepath, also=()):
+        """FBX_SCALE_NONE keeps the scale in the geometry instead of the FBX unit
+        header, which is what Unreal reads inconsistently and the cause of the
+        100x/1000x import mismatch."""
+        with sole_active(context, obj, also=also):
+            bpy.ops.export_scene.fbx(
+                filepath=filepath,
+                use_selection=True,
+                object_types={'MESH'},
+                global_scale=1.0,
+                apply_unit_scale=True,
+                apply_scale_options='FBX_SCALE_NONE',
+                use_space_transform=True,
+                bake_space_transform=False,
+                axis_forward='-Z',
+                axis_up='Y',
+                mesh_smooth_type='FACE',
+                use_mesh_modifiers=True,
+                add_leaf_bones=False,
+                bake_anim=False,
+            )
+
+
+# --- UI ------------------------------------------------------------------------
 
 class VIEW3D_PT_smart_tools(bpy.types.Panel):
     """Creates a Panel in the 3D Viewport Sidebar"""
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Hard Ops" 
+    bl_category = "Addon Test"
     bl_label = "Smart Tools"
 
     def draw(self, context):
         layout = self.layout
-        
+
+        self.draw_cutter_toggle(context, layout)
+        layout.separator()
+
         layout.label(text="Booleans:", icon='MOD_BOOLEAN')
-        row = layout.row(align=True)
-        row.scale_y = 1.5 
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        row = col.row(align=True)
         row.operator(OBJECT_OT_smart_difference.bl_idname, text="Difference")
         row.operator(OBJECT_OT_smart_slice.bl_idname, text="Slice")
-        
-        layout.separator()
-        
-        layout.label(text="Shading & Edges:", icon='MOD_BEVEL')
-        row2 = layout.row()
-        row2.scale_y = 1.5
-        row2.operator(OBJECT_OT_smart_bevel.bl_idname, text="Smart Bevel")
-        
-        layout.separator()
-        
-        layout.label(text="UV & Prep:", icon='UV')
-        row3 = layout.row()
-        row3.scale_y = 1.5
-        row3.operator(OBJECT_OT_smart_uv.bl_idname, text="Auto UV")
+        col.operator(OBJECT_OT_smart_union.bl_idname, text="Union")
+        col.operator(MESH_OT_panel_line.bl_idname, text="Panel Line")
 
         layout.separator()
-        
+
+        layout.label(text="Align & Origin:", icon='ORIENTATION_NORMAL')
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        col.operator(MESH_OT_cursor_to_face.bl_idname, text="Align Cursor to Face")
+        col.operator(OBJECT_OT_snap_to_cursor.bl_idname, text="Snap to Cursor")
+        col.operator(OBJECT_OT_origin_to_bottom.bl_idname, text="Origin to Bottom")
+
+        layout.separator()
+
+        layout.label(text="Arrays:", icon='MOD_ARRAY')
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        row = col.row(align=True)
+        row.operator(OBJECT_OT_radial_array.bl_idname, text="Radial")
+        row.operator(OBJECT_OT_linear_array.bl_idname, text="Linear")
+        col.operator(OBJECT_OT_sync_radial_arrays.bl_idname, text="Sync Radial",
+                     icon='FILE_REFRESH')
+
+        row = col.row(align=True)
+        row.operator(OBJECT_OT_drop_cable.bl_idname, text="Drop Cable", icon='FORCE_CURVE')
+        row.operator(OBJECT_OT_rehang_cables.bl_idname, text="", icon='FILE_REFRESH')
+
+        active = context.active_object
+        if active is not None and active.get("cable_head") is not None:
+            box = layout.box()
+            box.label(text=active.name, icon='OUTLINER_OB_CURVE')
+            box.prop(active, "cable_sag")
+            box.prop(active, "cable_lead")
+            box.prop(active.data, "bevel_depth", text="Radius")
+            box.prop(active.data, "resolution_u", text="Resolution")
+            row = box.row(align=True)
+            row.operator(OBJECT_OT_drape_cable.bl_idname, text="Drape", icon='PHYSICS')
+            row.operator(OBJECT_OT_rehang_cables.bl_idname, text="Re-hang")
+            if active.get("cable_draped"):
+                note = box.row()
+                note.enabled = False
+                note.label(text="Draped: sliders will re-hang it", icon='INFO')
+
+        layout.separator()
+
+        layout.label(text="Shading & Edges:", icon='MOD_BEVEL')
+        row = layout.row()
+        row.scale_y = 1.5
+        row.operator(OBJECT_OT_smart_bevel.bl_idname, text="Smart Bevel")
+
+        self.draw_live_bevel(context, layout)
+        self.draw_bevel_layers(context, layout)
+        self.draw_bevel_resolution(context, layout)
+
+        layout.separator()
+
+        layout.label(text="UV & Prep:", icon='UV')
+        row = layout.row()
+        row.scale_y = 1.5
+        row.operator(OBJECT_OT_smart_uv.bl_idname, text="Auto UV")
+
+        layout.separator()
+
+        layout.label(text="Pre-flight:", icon='CHECKMARK')
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        col.operator(OBJECT_OT_preflight_scan.bl_idname, text="Scan & Sanitize")
+        col.operator(OBJECT_OT_smart_triangulate.bl_idname, text="Triangulate for Engine")
+        row = col.row(align=True)
+        row.operator(OBJECT_OT_add_collision_box.bl_idname, text="Add Hull Box")
+        row.operator(OBJECT_OT_generate_ucx.bl_idname, text="Generate UCX")
+
+        active = context.active_object
+        if active is not None and active.type == 'MESH':
+            hulls = collision_hulls(active)
+            if hulls:
+                note = layout.row()
+                note.enabled = False
+                note.label(text=f"{len(hulls)} collision hull(s) attached", icon='MESH_CUBE')
+            elif len(context.selected_objects) < 2:
+                # Generate UCX polls on having something to convert. Saying so
+                # beats a greyed-out button with no reason attached.
+                hint = layout.row()
+                hint.enabled = False
+                hint.label(text="Add a hull box, then select it and the mesh last",
+                           icon='INFO')
+        active = context.active_object
+        if active is not None and active.get("preflight_report"):
+            note = layout.row()
+            report = active["preflight_report"]
+            note.alert = "needs a look" in report
+            note.label(text=report, icon='INFO')
+
+        layout.separator()
+
         layout.label(text="UE5 Pipeline:", icon='EXPORT')
-        layout.prop(context.scene, "smart_export_path", text="")
-        
-        row4 = layout.row(align=True)
-        row4.scale_y = 1.5
-        op_high = row4.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="High Poly")
-        op_high.export_type = 'HIGH'
-        op_low = row4.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="Low Poly")
-        op_low.export_type = 'LOW'
+        if abs(context.scene.unit_settings.scale_length - 1.0) > 1e-6:
+            warning = layout.box()
+            warning.alert = True
+            warning.label(text="Scene Unit Scale is not 1.0", icon='ERROR')
+
+        scene = context.scene
+        layout.prop(scene, "smart_export_path", text="")
+        layout.prop(scene, "smart_export_origin", text="Origin")
+
+        layout.prop(scene, "smart_export_clean")
+        if scene.smart_export_clean:
+            col = layout.column(align=True)
+            col.prop(scene, "smart_export_merge_distance")
+            col.prop(scene, "smart_export_remove_interior")
+
+        layout.prop(scene, "smart_export_triangulate")
+        if scene.smart_export_triangulate:
+            layout.prop(scene, "smart_export_quad_method", text="Split")
+
+        layout.prop(scene, "smart_export_unwrap")
+
+        if scene.smart_export_unwrap:
+            col = layout.column(align=True)
+            col.prop(scene, "smart_export_seam_angle")
+            col.prop(scene, "smart_export_margin")
+
+        row = layout.row(align=True)
+        row.scale_y = 1.5
+        row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="High Poly").export_type = 'HIGH'
+        row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="Low Poly").export_type = 'LOW'
+
+    @staticmethod
+    def draw_live_bevel(context, layout):
+        """The active object's own bevel settings, drawn straight from the
+        modifier. Nothing is copied or cached, so every widget here is the live
+        value and dragging one updates the viewport without running anything."""
+        active = context.active_object
+        if active is None or active.type != 'MESH':
+            return
+        bevel = active.modifiers.get(BEVEL_MOD)
+        if bevel is None:
+            return
+
+        box = layout.box()
+        box.label(text="Live Bevel", icon='MOD_BEVEL')
+        box.prop(bevel, "limit_method", text="Limit")
+
+        column = box.column(align=True)
+        column.prop(bevel, "width")
+        column.prop(bevel, "segments")
+        column.prop(bevel, "profile")
+        if bevel.limit_method == 'ANGLE':
+            column.prop(bevel, "angle_limit")
+
+        row = box.row(align=True)
+        row.prop(bevel, "harden_normals", text="Harden", toggle=True)
+        row.prop(bevel, "use_clamp_overlap", text="Clamp", toggle=True)
+        row.prop(bevel, "loop_slide", text="Slide", toggle=True)
+
+        column = box.column(align=True)
+        column.prop(bevel, "miter_outer", text="Outer")
+        column.prop(bevel, "miter_inner", text="Inner")
+        if bevel.miter_inner == 'MITER_ARC':
+            column.prop(bevel, "spread")
+
+        corner = active.modifiers.get(VERTEX_BEVEL_MOD)
+        if corner is not None:
+            sub = box.box()
+            sub.label(text="Vertex Bevel", icon='VERTEXSEL')
+            sub.prop(corner, "width")
+            sub.prop(corner, "segments")
+
+        if context.mode == 'EDIT_MESH':
+            box.separator()
+            box.label(text="Weight on selection:")
+            row = box.row(align=True)
+            for value, label in ((1.0, "Full"), (0.5, "Half"), (0.25, "Light"), (0.0, "None")):
+                entry = row.operator(MESH_OT_set_bevel_weight.bl_idname, text=label)
+                entry.weight = value
+                entry.domain = 'EDGE'
+            row = box.row(align=True)
+            row.label(text="Corners:")
+            for value, label in ((1.0, "On"), (0.0, "Off")):
+                entry = row.operator(MESH_OT_set_bevel_weight.bl_idname, text=label)
+                entry.weight = value
+                entry.domain = 'VERTEX'
+        elif bevel.limit_method == 'WEIGHT':
+            hint = box.row()
+            hint.enabled = False
+            hint.label(text="Tab into Edit Mode to dial individual edges", icon='INFO')
+
+    @staticmethod
+    def draw_bevel_layers(context, layout):
+        """One box per bevel layer, each with its own width and segments.
+
+        Drawn from the modifiers themselves, so the widgets are live: this is
+        the whole point of layers over a single shared weight, which can only
+        scale one width up and down.
+        """
+        active = context.active_object
+        if active is None or active.type != 'MESH':
+            return
+
+        layers = bevel_layers(active)
+        box = layout.box()
+        row = box.row(align=True)
+        row.label(text=f"Bevel Layers ({len(layers)})", icon='MOD_BEVEL')
+
+        if context.mode == 'EDIT_MESH':
+            box.operator(MESH_OT_add_bevel_layer.bl_idname,
+                         text="Bevel Selection Separately", icon='ADD')
+        elif not layers:
+            hint = box.row()
+            hint.enabled = False
+            hint.label(text="Tab into Edit Mode to add one", icon='INFO')
+
+        for modifier in layers:
+            sub = box.box()
+            header = sub.row(align=True)
+            header.prop(modifier, "show_viewport", text="")
+            header.label(text=modifier.name.replace(BEVEL_LAYER_MOD, "Layer"))
+            header.operator(OBJECT_OT_remove_bevel_layer.bl_idname,
+                            text="", icon='X').modifier_name = modifier.name
+
+            if layer_attribute(active, modifier) is None:
+                warn = sub.row()
+                warn.alert = True
+                warn.label(text="Edge attribute missing", icon='ERROR')
+                continue
+
+            column = sub.column(align=True)
+            column.prop(modifier, "width")
+            column.prop(modifier, "segments")
+            column.prop(modifier, "profile")
+
+            if context.mode == 'EDIT_MESH':
+                row = sub.row(align=True)
+                add = row.operator(MESH_OT_assign_bevel_layer.bl_idname, text="Assign")
+                add.modifier_name = modifier.name
+                add.remove = False
+                drop = row.operator(MESH_OT_assign_bevel_layer.bl_idname, text="Remove")
+                drop.modifier_name = modifier.name
+                drop.remove = True
+
+    def draw_bevel_resolution(self, context, layout):
+        scene = context.scene
+        box = layout.box()
+
+        row = box.row(align=True)
+        row.prop(scene, "smart_bevel_segments")
+        row.prop(
+            scene, "smart_bevel_mute", text="",
+            icon='HIDE_ON' if scene.smart_bevel_mute else 'HIDE_OFF', toggle=True,
+        )
+
+        box.prop(scene, "smart_bevel_selected_only")
+        box.prop(scene, "smart_bevel_override_width")
+        if scene.smart_bevel_override_width:
+            box.prop(scene, "smart_bevel_width")
+
+        box.operator(OBJECT_OT_apply_bevel_resolution.bl_idname, icon='FILE_REFRESH')
+
+        # Two readouts, because they answer different questions. The active
+        # object line follows the click and says what is under the cursor; the
+        # scope line says what the slider above would change.
+        self.draw_active_bevel(context, box)
+        self.draw_scope_bevels(context, box)
+
+    @staticmethod
+    def draw_active_bevel(context, layout):
+        active = context.active_object
+        row = layout.row()
+
+        if active is None or active.type != 'MESH':
+            row.enabled = False
+            row.label(text="No active mesh")
+            return
+
+        bevels = [mod for mod in active.modifiers if is_smart_bevel(mod)]
+        if not bevels:
+            row.enabled = False
+            row.label(text=f"{active.name}: no Smart Bevel", icon='DOT')
+            return
+
+        if len(bevels) > 1:
+            row.label(text=f"{active.name}: {len(bevels)} Smart Bevels", icon='INFO')
+            return
+
+        bevel = bevels[0]
+        muted = "" if bevel.show_viewport else "  (muted)"
+        row.label(
+            text=f"{active.name}: {bevel.segments} seg, {bevel.width:.4g} wide{muted}",
+            icon='MOD_BEVEL',
+        )
+
+    @staticmethod
+    def draw_scope_bevels(context, layout):
+        scene = context.scene
+        scope = "Selected" if scene.smart_bevel_selected_only else "Scene"
+
+        # Counts modifiers, not bevelled edges. One object carries one
+        # Smart_Bevel whose angle limit handles every qualifying edge on the
+        # mesh, so "1" here says nothing about how much geometry it touches.
+        low = high = None
+        count = 0
+        for modifier in iter_smart_bevels(scene, context.view_layer,
+                                          scene.smart_bevel_selected_only):
+            count += 1
+            segments = modifier.segments
+            low = segments if low is None else min(low, segments)
+            high = segments if high is None else max(high, segments)
+
+        info = layout.row()
+        if not count:
+            info.enabled = False
+            info.label(text=f"{scope}: no Smart Bevel modifiers")
+        else:
+            span = f"{low}" if low == high else f"{low}-{high}"
+            info.label(text=f"{scope}: {count} modifier(s) at {span} segments",
+                       icon='CHECKMARK' if low == high else 'INFO')
+
+    @staticmethod
+    def draw_cutter_toggle(context, layout):
+        layer_coll = get_cutter_layer_collection(context)
+        collection = bpy.data.collections.get(CUTTER_COLLECTION)
+
+        if collection is None:
+            row = layout.row()
+            row.enabled = False
+            row.label(text="No cutters yet", icon='GHOST_DISABLED')
+            return
+
+        visible = cutters_visible(layer_coll)
+
+        row = layout.row()
+        row.scale_y = 2.0
+        row.operator(
+            OBJECT_OT_toggle_cutters.bl_idname,
+            text=f"Hide Cutters ({len(collection.objects)})" if visible else "Show Cutters",
+            icon='HIDE_OFF' if visible else 'HIDE_ON',
+        )
+
+        sub = layout.row()
+        sub.enabled = visible
+        sub.operator(OBJECT_OT_cutter_display.bl_idname, text="Wire / Solid", icon='SHADING_WIRE')
+
 
 classes = (
+    MESH_OT_cursor_to_face,
+    OBJECT_OT_snap_to_cursor,
+    OBJECT_OT_origin_to_bottom,
+    OBJECT_OT_drop_cable,
+    OBJECT_OT_drape_cable,
+    OBJECT_OT_rehang_cables,
+    OBJECT_OT_radial_array,
+    OBJECT_OT_linear_array,
+    OBJECT_OT_sync_radial_arrays,
+    OBJECT_OT_toggle_cutters,
+    OBJECT_OT_cutter_display,
     OBJECT_OT_smart_difference,
     OBJECT_OT_smart_slice,
+    OBJECT_OT_smart_union,
+    MESH_OT_panel_line,
     OBJECT_OT_smart_bevel,
+    MESH_OT_set_bevel_weight,
+    MESH_OT_add_bevel_layer,
+    MESH_OT_assign_bevel_layer,
+    OBJECT_OT_remove_bevel_layer,
+    OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
+    OBJECT_OT_preflight_scan,
+    OBJECT_OT_add_collision_box,
+    OBJECT_OT_generate_ucx,
+    OBJECT_OT_smart_triangulate,
     OBJECT_OT_smart_export_ue5,
     VIEW3D_PT_smart_tools,
 )
 
-def register():
-    bpy.types.Scene.smart_export_path = StringProperty(
+
+SCENE_PROPS = {
+    "smart_bevel_segments": IntProperty(
+        name="Segments",
+        description="Segment count pushed onto every Smart Bevel in range. Drag "
+                    "to change the whole scene's edge resolution live",
+        default=3, min=1, max=12,
+        update=_update_bevel_resolution,
+    ),
+    "smart_bevel_selected_only": BoolProperty(
+        name="Selected Objects Only",
+        description="Limit the slider and mute toggle to the current selection "
+                    "instead of the whole scene",
+        default=False,
+        # Deliberately no update callback: flipping the scope should not by
+        # itself rewrite every bevel in the scene. It takes effect on the next
+        # slider drag or Apply Resolution click.
+    ),
+    "smart_bevel_mute": BoolProperty(
+        name="Mute Bevels in Viewport",
+        description="Disable Smart Bevels in the viewport for framerate. Render "
+                    "and export visibility are untouched",
+        default=False,
+        update=_update_bevel_mute,
+    ),
+    "smart_bevel_override_width": BoolProperty(
+        name="Override Width",
+        description="Also force one width on every Smart Bevel. Off by default: "
+                    "the right width depends on each object's scale, so a global "
+                    "value flattens that judgement across the whole scene",
+        default=False,
+        update=_update_bevel_resolution,
+    ),
+    "smart_bevel_width": FloatProperty(
+        name="Width",
+        default=0.01, min=0.0001, max=10.0, precision=4, step=0.01,
+        subtype='DISTANCE',
+        update=_update_bevel_resolution,
+    ),
+    "smart_export_path": StringProperty(
         name="Export Directory",
         description="Choose a directory to export the FBX files",
-        subtype='DIR_PATH'
+        subtype='DIR_PATH',
+    ),
+    "smart_export_origin": EnumProperty(
+        name="Origin",
+        description="Where the exported mesh origin ends up",
+        items=[
+            ('KEEP', "Keep Origin", "Export with the origin exactly as authored"),
+            ('WORLD', "World Zero", "Move the object origin to the world origin"),
+            ('BOTTOM', "Bounds Bottom", "Recentre on the bounding box, origin at bottom centre"),
+        ],
+        default='KEEP',
+    ),
+    "smart_export_clean": BoolProperty(
+        name="Clean Mesh",
+        description="Weld, strip interior faces and loose geometry, and recalculate "
+                    "normals on the evaluated mesh before it is written",
+        default=True,
+    ),
+    "smart_export_merge_distance": FloatProperty(
+        name="Merge Distance",
+        description="Merge by Distance threshold applied to the evaluated mesh",
+        default=0.0001, min=0.0, max=0.1, precision=5, step=0.001,
+        subtype='DISTANCE',
+    ),
+    "smart_export_remove_interior": BoolProperty(
+        name="Remove Interior Faces",
+        description="Delete faces buried inside the solid, which a union over "
+                    "coplanar or non-watertight operands can leave behind",
+        default=True,
+    ),
+    "smart_export_triangulate": BoolProperty(
+        name="Triangulate on Export",
+        description="Write triangles into the FBX without committing the mesh in "
+                    "Blender to them. Both the baker and the engine then read the "
+                    "same split, which is what the mismatch artifacts come from",
+        default=True,
+    ),
+    "smart_export_quad_method": EnumProperty(
+        name="Quad Split", items=QUAD_METHODS, default='SHORTEST_DIAGONAL',
+    ),
+    "smart_export_unwrap": BoolProperty(
+        name="Unwrap Low Poly",
+        description="Unwrap the evaluated mesh so UVs match the boolean result",
+        default=True,
+    ),
+    "smart_export_margin": FloatProperty(
+        name="UV Margin", default=0.02, min=0.001, max=1.0,
+    ),
+    "smart_export_seam_angle": FloatProperty(
+        name="Seam Angle", default=0.523599, subtype='ANGLE',
+    ),
+}
+
+
+# Default hotkey for the cutter toggle. Change the last three arguments in
+# register_keymaps() to rebind, or clear it in Preferences > Keymap > Add-ons.
+addon_keymaps = []
+
+
+def register_keymaps():
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig is None:
+        return  # Background mode has no addon keyconfig to bind into.
+
+    keymap = keyconfig.keymaps.new(name='Object Mode', space_type='EMPTY')
+    item = keymap.keymap_items.new(
+        OBJECT_OT_toggle_cutters.bl_idname, 'H', 'PRESS', ctrl=True, shift=True,
     )
+    addon_keymaps.append((keymap, item))
+
+
+def unregister_keymaps():
+    # Remove exactly the items this addon added; leaving them behind is the
+    # classic way an addon breaks the user's keymap after a reload.
+    for keymap, item in addon_keymaps:
+        keymap.keymap_items.remove(item)
+    addon_keymaps.clear()
+
+
+OBJECT_PROPS = {
+    "cable_sag": FloatProperty(
+        name="Sag",
+        description="Droop at the middle, as a fraction of the distance spanned",
+        default=0.15, min=0.0, max=3.0, precision=3, step=1.0,
+        update=_update_cable,
+    ),
+    "cable_lead": FloatProperty(
+        name="Connector Lead",
+        description="How far the cable runs straight out of the connector before "
+                    "it starts to fall, as a fraction of the span",
+        default=0.18, min=0.0, max=1.0, precision=3, step=1.0,
+        update=_update_cable,
+    ),
+}
+
+
+def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    for name, prop in SCENE_PROPS.items():
+        setattr(bpy.types.Scene, name, prop)
+
+    for name, prop in OBJECT_PROPS.items():
+        setattr(bpy.types.Object, name, prop)
+
+    register_keymaps()
+
+    for handler in (sync_radial_arrays_on_update, rehang_cables_on_update):
+        if handler not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(handler)
+
+
 def unregister():
-    del bpy.types.Scene.smart_export_path
+    for handler in (sync_radial_arrays_on_update, rehang_cables_on_update):
+        if handler in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(handler)
+
+    unregister_keymaps()
+
+    # Classes come off first: the panel's draw() reads these scene properties.
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
+    for name in SCENE_PROPS:
+        if hasattr(bpy.types.Scene, name):
+            delattr(bpy.types.Scene, name)
+
+    for name in OBJECT_PROPS:
+        if hasattr(bpy.types.Object, name):
+            delattr(bpy.types.Object, name)
+
+
 if __name__ == "__main__":
     register()
-```
