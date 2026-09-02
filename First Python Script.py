@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Smart Hard Surface Tools",
     "author": "Niall",
-    "version": (1, 5),
+    "version": (1, 6),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar (N) > Addon Test",
     "description": "Automates booleans, shading, UVs, and UE5 exporting.",
@@ -2770,6 +2770,19 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                 temp, shift = self.build_export_copy(context, source, name,
                                                      scene.smart_export_origin)
                 hulls = self.build_collision_copies(context, source_hulls, name, shift)
+                # A duplicate suffix here means something still held the name.
+                # It is silent in Blender and fatal in Unreal, which matches
+                # collision by exact name, so it fails loudly instead.
+                mangled = [obj.name for obj in [temp] + hulls if "." in obj.name]
+                if mangled:
+                    for hull in hulls:
+                        bpy.data.objects.remove(hull, do_unlink=True)
+                    bpy.data.objects.remove(temp, do_unlink=True)
+                    self.report({'ERROR'},
+                                f"Name collision on export: {', '.join(mangled)}. "
+                                "Nothing was written.")
+                    return {'CANCELLED'}
+
                 verts, faces = self.export_one(context, scene, source, temp, hulls,
                                                name, export_dir, leaky)
                 cleaned_verts += verts
