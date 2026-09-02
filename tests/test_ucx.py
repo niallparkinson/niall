@@ -3,12 +3,6 @@
     pip install bpy
     cp "First Python Script.py" tests/hstools.py
     cd tests && python3 test_ucx.py
-
-Unverified assumption, flagged deliberately: that Unreal matches UCX_<name> to
-the render mesh's name *inside the FBX*. The Epic documentation is unreachable
-from this environment, so the code derives the hull name and the render mesh
-name from one shared value, which makes them agree whatever the rule turns out
-to be. If Unreal instead wants the bare asset name, flip Match Export Name off.
 """
 import bpy, sys, tempfile, os
 from mathutils import Vector
@@ -112,7 +106,7 @@ inst = Harness()
 gaps={}
 for mode in ('KEEP','WORLD','BOTTOM'):
     temp, shift = inst.build_export_copy(bpy.context, d, name, mode)
-    hulls = op.build_collision_copies(bpy.context, d, name, shift)
+    hulls = op.build_collision_copies(bpy.context, H.collision_hulls(d), name, shift)
     bpy.context.view_layer.update()
     rl,rh = H.mesh_bounds(temp.data, temp.matrix_world)
     hl,hh = H.mesh_bounds(hulls[0].data, hulls[0].matrix_world)
@@ -126,6 +120,39 @@ rep("hull keeps the same offset under every origin mode", spread < 1e-5,
     f"max difference {spread:.2e}, offset {tuple(round(v,3) for v in gaps['KEEP'])}")
 rep("and the offset is the authored one", abs(gaps['KEEP'].length - 1.1314) < 1e-3,
     f"{gaps['KEEP'].length:.4f}")
+H.unregister()
+
+print("6b. exported names carry no Blender duplicate suffix")
+fresh()
+d, boxes = desk(3)
+pick(d, boxes)
+bpy.ops.object.generate_ucx()
+op=[c for c in H.classes if c.__name__=="OBJECT_OT_smart_export_ue5"][0]
+name=H.export_asset_name(d.name,'LOW')
+class H2:
+    export_type="LOW"
+    recentre_on_bounds=staticmethod(op.recentre_on_bounds)
+    build_export_copy=op.build_export_copy
+source_hulls = H.collision_hulls(d)
+with H.names_released([d] + source_hulls):
+    temp, shift = H2().build_export_copy(bpy.context, d, name, 'KEEP')
+    copies = op.build_collision_copies(bpy.context, source_hulls, name, shift)
+    written = [(o.name, o.data.name) for o in [temp]+copies]
+    for o in copies:
+        m=o.data; bpy.data.objects.remove(o, do_unlink=True); bpy.data.meshes.remove(m)
+    m=temp.data; bpy.data.objects.remove(temp, do_unlink=True); bpy.data.meshes.remove(m)
+
+# A dot becomes an underscore in FBX, and Unreal matches collision by exact
+# name, so UCX_..._03.001 arrives as UCX_..._03_001 and binds to nothing.
+dotted=[n for pair in written for n in pair if "." in n]
+rep("no duplicate suffixes on anything exported", not dotted, str(dotted))
+rep("render mesh named exactly as intended", written[0]==(name, name), str(written[0]))
+rep("collision named to match it",
+    [w[0] for w in written[1:]] == [f"UCX_{name}_{i:02d}" for i in (1,2,3)],
+    str([w[0] for w in written[1:]]))
+rep("originals got their names back",
+    d.name=="SM_Desk_low" and sorted(c.name for c in d.children)==
+    [f"UCX_{name}_{i:02d}" for i in (1,2,3)])
 H.unregister()
 
 print("7. the archway workflow, from a bare mesh to a compound hull")

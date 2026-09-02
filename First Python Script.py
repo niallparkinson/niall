@@ -1167,6 +1167,40 @@ def collision_hulls(target):
             if child.type == 'MESH' and is_collision(child)]
 
 
+@contextmanager
+def names_released(objects):
+    """Park objects on placeholder names so copies can hold the real ones.
+
+    Blender keeps names unique per datablock, so a copy made while the original
+    still holds the name is given a .001 suffix. FBX writes a dot as an
+    underscore, and Unreal matches collision to a render mesh by exact name, so
+    UCX_SM_Archway_low_03 leaves Blender as UCX_SM_Archway_low_03_001 and binds
+    to nothing. Freeing the names first is what stops that.
+    """
+    saved_objects = [(obj, obj.name) for obj in objects]
+    seen = []
+    saved_data = []
+    for obj in objects:
+        if obj.data is not None and obj.data not in seen:
+            seen.append(obj.data)
+            saved_data.append((obj.data, obj.data.name))
+
+    for index, (obj, _) in enumerate(saved_objects):
+        obj.name = f"__released_{index}"
+    for index, (data, _) in enumerate(saved_data):
+        data.name = f"__released_data_{index}"
+
+    try:
+        yield
+    finally:
+        # Restoring only works once the copies holding these names are gone,
+        # so the caller has to keep this open across its own teardown.
+        for data, name in saved_data:
+            data.name = name
+        for obj, name in saved_objects:
+            obj.name = name
+
+
 def sanitize_filename(name):
     cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
     return cleaned or "Mesh"
@@ -2727,55 +2761,21 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
         collision = 0
         for source in sources:
             name = self.asset_name(source.name)
-            temp, shift = self.build_export_copy(context, source, name,
-                                                 scene.smart_export_origin)
-            hulls = self.build_collision_copies(context, source, name, shift)
-            try:
-                # Clean before unwrapping: the UVs must describe the final mesh.
-                if scene.smart_export_clean:
-                    verts, faces, open_edges = clean_mesh(
-                        context, temp,
-                        scene.smart_export_merge_distance,
-                        scene.smart_export_remove_interior)
-                    cleaned_verts += verts
-                    cleaned_faces += faces
-                    if open_edges:
-                        leaky.append(f"{source.name} ({open_edges})")
-
-                # High poly is a bake source only, so it never needs UVs. A
-                # curve already carries the straight strip UV Blender generates
-                # for it, which is exactly what a cable wants; re-unwrapping by
-                # angle would throw that away.
-                if (self.export_type == 'LOW' and scene.smart_export_unwrap
-                        and source.type == 'MESH'):
-                    auto_unwrap(context, temp, scene.smart_export_seam_angle,
-                                scene.smart_export_margin, True)
-                # Freeze triangles on the copy that is actually written. This
-                # is what stops the baker and the engine each choosing their
-                # own split, without committing the editable mesh to triangles.
-                if scene.smart_export_triangulate:
-                    ensure_triangulation(temp, scene.smart_export_quad_method,
-                                         'BEAUTY', False, True)
-
-                self.write_fbx(context, temp, os.path.join(export_dir, f"{name}.fbx"),
-                               also=hulls)
+            # Held open across the teardown below: the originals cannot take
+            # their names back until the copies using them have been removed.
+            # Captured before the names are released: collision is identified by
+            # its UCX_ prefix, which the release temporarily takes away.
+            source_hulls = collision_hulls(source)
+            with names_released([source] + source_hulls):
+                temp, shift = self.build_export_copy(context, source, name,
+                                                     scene.smart_export_origin)
+                hulls = self.build_collision_copies(context, source_hulls, name, shift)
+                verts, faces = self.export_one(context, scene, source, temp, hulls,
+                                               name, export_dir, leaky)
+                cleaned_verts += verts
+                cleaned_faces += faces
                 written += 1
                 collision += len(hulls)
-            finally:
-                for hull in hulls:
-                    hull_mesh = hull.data
-                    bpy.data.objects.remove(hull, do_unlink=True)
-                    bpy.data.meshes.remove(hull_mesh)
-                mesh = temp.data
-                bpy.data.objects.remove(temp, do_unlink=True)
-                bpy.data.meshes.remove(mesh)
-
-        if leaky:
-            self.report({'WARNING'},
-                        "Exported with open edges, so these are not watertight: "
-                        + ", ".join(leaky[:4])
-                        + ". Run Scan & Sanitize to find them.")
-
         summary = f"Exported {written} FBX file(s) to {export_dir}"
         if collision:
             summary += f" with {collision} collision hull(s)"
@@ -2783,6 +2783,47 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
             summary += f" (removed {cleaned_verts} vertices, {cleaned_faces} faces)"
         self.report({'INFO'}, summary)
         return {'FINISHED'}
+
+    def export_one(self, context, scene, source, temp, hulls, name, export_dir, leaky):
+        """Prepare and write one render mesh together with its collision."""
+        cleaned_verts = cleaned_faces = 0
+        try:
+            # Clean before unwrapping: the UVs must describe the final mesh.
+            if scene.smart_export_clean:
+                cleaned_verts, cleaned_faces, open_edges = clean_mesh(
+                    context, temp,
+                    scene.smart_export_merge_distance,
+                    scene.smart_export_remove_interior)
+                if open_edges:
+                    leaky.append(f"{source.name} ({open_edges})")
+
+            # High poly is a bake source only, so it never needs UVs. A curve
+            # already carries the straight strip UV Blender generates for it,
+            # which is exactly what a cable wants; re-unwrapping by angle would
+            # throw that away.
+            if (self.export_type == 'LOW' and scene.smart_export_unwrap
+                    and source.type == 'MESH'):
+                auto_unwrap(context, temp, scene.smart_export_seam_angle,
+                            scene.smart_export_margin, True)
+
+            # Freeze triangles on the copy that is actually written, so the
+            # baker and the engine cannot each choose their own split.
+            if scene.smart_export_triangulate:
+                ensure_triangulation(temp, scene.smart_export_quad_method,
+                                     'BEAUTY', False, True)
+
+            self.write_fbx(context, temp, os.path.join(export_dir, f"{name}.fbx"),
+                           also=hulls)
+        finally:
+            for hull in hulls:
+                hull_mesh = hull.data
+                bpy.data.objects.remove(hull, do_unlink=True)
+                bpy.data.meshes.remove(hull_mesh)
+            mesh = temp.data
+            bpy.data.objects.remove(temp, do_unlink=True)
+            bpy.data.meshes.remove(mesh)
+
+        return cleaned_verts, cleaned_faces
 
     def asset_name(self, raw_name):
         return export_asset_name(raw_name, self.export_type)
@@ -2837,7 +2878,7 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
         return offset
 
     @staticmethod
-    def build_collision_copies(context, source, render_name, shift):
+    def build_collision_copies(context, source_hulls, render_name, shift):
         """Copies of the render mesh's collision hulls, renamed to bind to it.
 
         Unreal matches collision to a render mesh by the name inside the FBX, so
@@ -2847,7 +2888,7 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
         """
         depsgraph = context.evaluated_depsgraph_get()
         copies = []
-        for index, hull in enumerate(collision_hulls(source), start=1):
+        for index, hull in enumerate(source_hulls, start=1):
             mesh = bpy.data.meshes.new_from_object(
                 hull.evaluated_get(depsgraph), preserve_all_data_layers=True,
                 depsgraph=depsgraph)
