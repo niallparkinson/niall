@@ -61,7 +61,7 @@ BOOLEAN_SOLVERS = _boolean_solver_items()
 # --- HELPERS -----------------------------------------------------------------
 
 @contextmanager
-def sole_active(context, obj):
+def sole_active(context, obj, also=()):
     """Make obj the only selected + active object, then restore the user's selection.
 
     Every operator that needs bpy.ops to act on one specific object goes through
@@ -79,6 +79,9 @@ def sole_active(context, obj):
         other.select_set(False)
 
     obj.select_set(True)
+    for extra in also:
+        if extra.name in view_layer.objects:
+            extra.select_set(True)
     view_layer.objects.active = obj
     try:
         yield
@@ -89,6 +92,9 @@ def sole_active(context, obj):
         # obj may have been removed by the caller's teardown.
         if obj.name in view_layer.objects:
             obj.select_set(False)
+        for extra in also:
+            if extra.name in view_layer.objects:
+                extra.select_set(False)
         for other in prev_selected:
             if other.name in view_layer.objects:
                 other.select_set(True)
@@ -1128,6 +1134,39 @@ def ensure_triangulation(obj, quad_method, ngon_method, ngon_only,
     return modifier
 
 
+# Unreal binds collision to a render mesh by name, so these prefixes are not
+# decoration. UCX is a convex hull; the others are primitive shapes.
+COLLISION_PREFIXES = ("UCX_", "UBX_", "UCP_", "USP_")
+
+
+def strip_asset_affixes(raw_name):
+    """The bare asset name, with Blender's duplicate suffix and SM_/_low removed."""
+    name = DUPLICATE_SUFFIX.sub("", raw_name)
+    if name.startswith("SM_"):
+        name = name[3:]
+    for suffix in ("_high", "_low"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    return name
+
+
+def export_asset_name(raw_name, export_type):
+    """The name the render mesh will carry inside the FBX."""
+    suffix = "_high" if export_type == 'HIGH' else "_low"
+    return sanitize_filename(f"SM_{strip_asset_affixes(raw_name)}{suffix}")
+
+
+def is_collision(obj):
+    return obj.name.startswith(COLLISION_PREFIXES)
+
+
+def collision_hulls(target):
+    """Collision objects parented to a render mesh."""
+    return [child for child in target.children
+            if child.type == 'MESH' and is_collision(child)]
+
+
 def sanitize_filename(name):
     cleaned = "".join("_" if char in INVALID_FILENAME_CHARS else char for char in name).strip()
     return cleaned or "Mesh"
@@ -1143,7 +1182,10 @@ EXPORTABLE_TYPES = {'MESH', 'CURVE', 'SURFACE', 'FONT'}
 
 
 def selected_exportable(context):
-    return [obj for obj in context.selected_objects if obj.type in EXPORTABLE_TYPES]
+    # Collision travels inside its render mesh's file, so it is never a source
+    # on its own: otherwise selecting a desk and its hulls writes four FBXs.
+    return [obj for obj in context.selected_objects
+            if obj.type in EXPORTABLE_TYPES and not is_collision(obj)]
 
 
 # --- ORIGIN & ALIGNMENT -------------------------------------------------------
@@ -2424,6 +2466,71 @@ class OBJECT_OT_preflight_scan(bpy.types.Operator):
         return ", ".join(parts) if parts else "Clean"
 
 
+class OBJECT_OT_generate_ucx(bpy.types.Operator):
+    """Turn the selected boxes into collision hulls for the active mesh"""
+    bl_idname = "object.generate_ucx"
+    bl_label = "Generate UCX"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    display_as: EnumProperty(
+        name="Display",
+        items=[('WIRE', "Wireframe", "Show the hull as a wireframe cage"),
+               ('BOUNDS', "Bounds", "Show only the hull's bounding box")],
+        default='WIRE',
+    )
+    match_export_name: BoolProperty(
+        name="Match Export Name",
+        description="Name the hulls after the mesh name the exporter will write, "
+                    "which is what Unreal matches against. Turn it off for the "
+                    "shorter bare asset name, which reads better in the outliner",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        return (context.mode == 'OBJECT' and active is not None
+                and active.type == 'MESH' and len(context.selected_objects) >= 2)
+
+    def execute(self, context):
+        target = context.active_object
+        picked = [obj for obj in context.selected_objects
+                  if obj is not target and obj.type == 'MESH']
+        if not picked:
+            self.report({'ERROR'}, "Select the hulls, then the render mesh last.")
+            return {'CANCELLED'}
+
+        # Hulls already attached are renumbered alongside the new ones, so
+        # adding a sixth box to a set of five does not collide with UCX_..._01.
+        existing = [hull for hull in collision_hulls(target) if hull not in picked]
+        hulls = existing + picked
+
+        base = (export_asset_name(target.name, 'LOW') if self.match_export_name
+                else strip_asset_affixes(target.name))
+
+        # Two passes: Blender appends .001 to a name already in use, so every
+        # hull is parked on a placeholder before the real names are handed out.
+        for index, hull in enumerate(hulls):
+            hull.name = f"__ucx_pending_{index}"
+
+        for index, hull in enumerate(hulls, start=1):
+            name = f"UCX_{base}_{index:02d}"
+            hull.name = name
+            hull.data.name = name
+            hull.display_type = self.display_as
+            hull.hide_render = True
+
+            if hull.parent is not target:
+                # Parent inverse cancels the target's current matrix, so the
+                # hull does not jump when it is attached.
+                hull.parent = target
+                hull.matrix_parent_inverse = target.matrix_world.inverted_safe()
+
+        self.report({'INFO'}, f"{len(hulls)} hull(s) named UCX_{base}_01..{len(hulls):02d} "
+                              f"and parented to {target.name}.")
+        return {'FINISHED'}
+
+
 class OBJECT_OT_smart_triangulate(bpy.types.Operator):
     """Freeze the mesh into triangles the way an engine will read it"""
     bl_idname = "object.smart_triangulate"
@@ -2563,9 +2670,12 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
         cleaned_verts = 0
         cleaned_faces = 0
         leaky = []
+        collision = 0
         for source in sources:
             name = self.asset_name(source.name)
-            temp = self.build_export_copy(context, source, name, scene.smart_export_origin)
+            temp, shift = self.build_export_copy(context, source, name,
+                                                 scene.smart_export_origin)
+            hulls = self.build_collision_copies(context, source, name, shift)
             try:
                 # Clean before unwrapping: the UVs must describe the final mesh.
                 if scene.smart_export_clean:
@@ -2593,9 +2703,15 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                     ensure_triangulation(temp, scene.smart_export_quad_method,
                                          'BEAUTY', False, True)
 
-                self.write_fbx(context, temp, os.path.join(export_dir, f"{name}.fbx"))
+                self.write_fbx(context, temp, os.path.join(export_dir, f"{name}.fbx"),
+                               also=hulls)
                 written += 1
+                collision += len(hulls)
             finally:
+                for hull in hulls:
+                    hull_mesh = hull.data
+                    bpy.data.objects.remove(hull, do_unlink=True)
+                    bpy.data.meshes.remove(hull_mesh)
                 mesh = temp.data
                 bpy.data.objects.remove(temp, do_unlink=True)
                 bpy.data.meshes.remove(mesh)
@@ -2607,21 +2723,15 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                         + ". Run Scan & Sanitize to find them.")
 
         summary = f"Exported {written} FBX file(s) to {export_dir}"
+        if collision:
+            summary += f" with {collision} collision hull(s)"
         if cleaned_verts or cleaned_faces:
             summary += f" (removed {cleaned_verts} vertices, {cleaned_faces} faces)"
         self.report({'INFO'}, summary)
         return {'FINISHED'}
 
     def asset_name(self, raw_name):
-        name = DUPLICATE_SUFFIX.sub("", raw_name)
-        if name.startswith("SM_"):
-            name = name[3:]
-        for suffix in ("_high", "_low"):
-            if name.endswith(suffix):
-                name = name[:-len(suffix)]
-                break
-        suffix = "_high" if self.export_type == 'HIGH' else "_low"
-        return sanitize_filename(f"SM_{name}{suffix}")
+        return export_asset_name(raw_name, self.export_type)
 
     def build_export_copy(self, context, source, name, origin_mode):
         """Build a throwaway object holding the fully evaluated mesh.
@@ -2650,27 +2760,60 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
             mesh.flip_normals()
         temp.matrix_world = Matrix.Translation(location)
 
+        # Whatever the origin mode shifts the render mesh by, the collision has
+        # to move by the same amount or it lands somewhere else in the engine.
+        shift = Matrix.Identity(4)
         if origin_mode == 'WORLD':
             temp.matrix_world = Matrix.Identity(4)
+            shift = Matrix.Translation(-location)
         elif origin_mode == 'BOTTOM':
-            self.recentre_on_bounds(mesh)
+            offset = self.recentre_on_bounds(mesh)
             temp.matrix_world = Matrix.Identity(4)
+            shift = Matrix.Translation(-location - offset)
 
-        return temp
+        return temp, shift
 
     @staticmethod
     def recentre_on_bounds(mesh):
         low, high = mesh_bounds(mesh, Matrix.Identity(4))
         if low is None:
-            return
-        mesh.transform(Matrix.Translation(-bottom_centre(low, high)))
+            return Vector((0.0, 0.0, 0.0))
+        offset = bottom_centre(low, high)
+        mesh.transform(Matrix.Translation(-offset))
+        return offset
 
     @staticmethod
-    def write_fbx(context, obj, filepath):
+    def build_collision_copies(context, source, render_name, shift):
+        """Copies of the render mesh's collision hulls, renamed to bind to it.
+
+        Unreal matches collision to a render mesh by the name inside the FBX, so
+        the hulls are renamed from the same string the render mesh was named
+        from. Deriving both from one value is what makes the match impossible to
+        get wrong, whatever the objects happen to be called in Blender.
+        """
+        depsgraph = context.evaluated_depsgraph_get()
+        copies = []
+        for index, hull in enumerate(collision_hulls(source), start=1):
+            mesh = bpy.data.meshes.new_from_object(
+                hull.evaluated_get(depsgraph), preserve_all_data_layers=True,
+                depsgraph=depsgraph)
+            name = f"UCX_{render_name}_{index:02d}"
+            mesh.name = name
+
+            copy = bpy.data.objects.new(name, mesh)
+            context.scene.collection.objects.link(copy)
+            # Bake the hull's own transform, then apply the render mesh's shift.
+            mesh.transform(hull.matrix_world)
+            copy.matrix_world = shift
+            copies.append(copy)
+        return copies
+
+    @staticmethod
+    def write_fbx(context, obj, filepath, also=()):
         """FBX_SCALE_NONE keeps the scale in the geometry instead of the FBX unit
         header, which is what Unreal reads inconsistently and the cause of the
         100x/1000x import mismatch."""
-        with sole_active(context, obj):
+        with sole_active(context, obj, also=also):
             bpy.ops.export_scene.fbx(
                 filepath=filepath,
                 use_selection=True,
@@ -2776,6 +2919,14 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         col.scale_y = 1.5
         col.operator(OBJECT_OT_preflight_scan.bl_idname, text="Scan & Sanitize")
         col.operator(OBJECT_OT_smart_triangulate.bl_idname, text="Triangulate for Engine")
+        col.operator(OBJECT_OT_generate_ucx.bl_idname, text="Generate UCX")
+        active = context.active_object
+        if active is not None and active.type == 'MESH':
+            hulls = collision_hulls(active)
+            if hulls:
+                note = layout.row()
+                note.enabled = False
+                note.label(text=f"{len(hulls)} collision hull(s) attached", icon='MESH_CUBE')
         active = context.active_object
         if active is not None and active.get("preflight_report"):
             note = layout.row()
@@ -2940,6 +3091,7 @@ classes = (
     OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
     OBJECT_OT_preflight_scan,
+    OBJECT_OT_generate_ucx,
     OBJECT_OT_smart_triangulate,
     OBJECT_OT_smart_export_ue5,
     VIEW3D_PT_smart_tools,
