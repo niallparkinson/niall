@@ -1,0 +1,486 @@
+# ███╗   ██╗██████╗
+# ████╗  ██║██╔══██╗
+# ██╔██╗ ██║██║  ██║
+# ██║╚██╗██║██║  ██║
+# ██║ ╚████║██████╔╝
+# ╚═╝  ╚═══╝╚═════╝
+#
+# ND (Non-Destructive) Blender Add-on
+# Copyright (C) 2024 Tristan S. & Ian J. (HugeMenace)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# ---
+# Contributors: Tristo (HM)
+# ---
+
+import bpy
+import bmesh
+from math import radians, degrees
+from .. lib.base_operator import BaseOperator
+from .. lib.overlay import update_overlay, init_overlay, toggle_pin_overlay, toggle_operator_passthrough, register_draw_handler, unregister_draw_handler, draw_header, draw_property, draw_hint
+from .. lib.events import capture_modifier_keys, pressed
+from .. lib.preferences import get_preferences
+from .. lib.numeric_input import update_stream, no_stream, get_stream_value, new_stream, set_stream, has_stream
+from .. lib.modifiers import new_modifier, remove_modifiers_ending_with, add_smooth_by_angle, ensure_tail_mod_consistency
+from .. lib.objects import get_real_active_object
+from .. lib.polling import ctx_obj_mode, obj_exists, obj_is_mesh, app_minor_version
+from .. lib.math import round_dec
+
+
+mod_bevel = "Bevel — ND B"
+mod_weld = "Weld — ND B"
+mod_summon_list = [mod_bevel]
+
+
+class ND_OT_bevel(BaseOperator):
+    bl_idname = "nd.bevel"
+    bl_label = "Object Bevel"
+    bl_description = """Adds a bevel modifier to the selected object
+CTRL — Remove existing modifiers
+SHIFT — Create a stacked bevel modifier"""
+
+
+    key_callbacks = {
+        'H': lambda cls, context, event: cls.handle_toggle_harden_normals(context, event),
+        'C': lambda cls, context, event: cls.handle_toggle_clamp_overlap(context, event),
+        'S': lambda cls, context, event: cls.handle_toggle_loop_slide(context, event),
+        'E': lambda cls, context, event: cls.handle_toggle_enhanced_wireframe(context, event),
+        'W': lambda cls, context, event: cls.handle_cycle_width_type(context, event),
+        'R': lambda cls, context, event: cls.handle_recall_previous_bevel(context, event),
+    }
+
+    modal_config = {
+        'MOVEMENT_PASSTHROUGH': True,
+        'ON_CANCEL': lambda cls, context: cls.revert(context),
+        'ON_CONFIRM': lambda cls, context: cls.finish(context),
+    }
+
+
+    @classmethod
+    def poll(cls, context):
+        target_object = get_real_active_object(context)
+        return ctx_obj_mode(context) and obj_exists(target_object) and obj_is_mesh(target_object)
+
+
+    def do_modal(self, context, event):
+        profile_factor = 0.01 if self.key_shift else 0.1
+        segment_factor = 1 if self.key_shift else 2
+        angle_factor = 1 if self.key_shift else 15
+        percent_factor = 1 if self.key_shift else 10
+
+        if self.key_numeric_input:
+            if not self.is_width_percent() and self.key_no_modifiers:
+                self.width_input_stream = update_stream(self.width_input_stream, event.type)
+                self.width = get_stream_value(self.width_input_stream, self.unit_scaled_factor)
+                self.mark_dirty()
+            elif self.is_width_percent() and self.key_no_modifiers:
+                self.percentage_input_stream = update_stream(self.percentage_input_stream, event.type)
+                self.percentage = get_stream_value(self.percentage_input_stream, min_value=0, max_value=100)
+                self.mark_dirty()
+            elif self.key_alt:
+                self.segments_input_stream = update_stream(self.segments_input_stream, event.type)
+                self.segments = int(get_stream_value(self.segments_input_stream, min_value=1))
+                self.mark_dirty()
+            elif self.key_ctrl:
+                self.profile_input_stream = update_stream(self.profile_input_stream, event.type)
+                self.profile = get_stream_value(self.profile_input_stream)
+                self.mark_dirty()
+            elif self.key_ctrl_alt:
+                self.angle_input_stream = update_stream(self.angle_input_stream, event.type)
+                self.angle = get_stream_value(self.angle_input_stream, min_value=0, max_value=360)
+                self.mark_dirty()
+
+        if self.key_reset:
+            if not self.is_width_percent() and self.key_no_modifiers:
+                if has_stream(self.width_input_stream) and self.hard_stream_reset or no_stream(self.width_input_stream):
+                    self.width = 0
+                    self.mark_dirty()
+                self.width_input_stream = new_stream()
+            elif self.is_width_percent() and self.key_no_modifiers:
+                if has_stream(self.percentage_input_stream) and self.hard_stream_reset or no_stream(self.percentage_input_stream):
+                    self.percentage = 0
+                    self.mark_dirty()
+                self.percentage_input_stream = new_stream()
+            elif self.key_alt:
+                if has_stream(self.segments_input_stream) and self.hard_stream_reset or no_stream(self.segments_input_stream):
+                    self.segments = 1
+                    self.mark_dirty()
+                self.segments_input_stream = new_stream()
+            elif self.key_ctrl:
+                if has_stream(self.profile_input_stream) and self.hard_stream_reset or no_stream(self.profile_input_stream):
+                    self.profile = 0.5
+                    self.mark_dirty()
+                self.profile_input_stream = new_stream()
+            elif self.key_ctrl_alt:
+                if has_stream(self.angle_input_stream) and self.hard_stream_reset or no_stream(self.angle_input_stream):
+                    self.angle = int(get_preferences().default_smoothing_angle)
+                    self.mark_dirty()
+                self.angle_input_stream = new_stream()
+
+        if self.key_step_up:
+            if self.extend_mouse_values and no_stream(self.segments_input_stream) and self.key_no_modifiers:
+                self.segments = 2 if self.segments == 1 else self.segments + segment_factor
+                self.mark_dirty()
+            elif no_stream(self.segments_input_stream) and self.key_alt:
+                self.segments = 2 if self.segments == 1 else self.segments + segment_factor
+                self.mark_dirty()
+            elif no_stream(self.profile_input_stream) and self.key_ctrl:
+                self.profile = min(1, round_dec(self.profile + profile_factor))
+                self.mark_dirty()
+            elif no_stream(self.angle_input_stream) and self.key_ctrl_alt:
+                self.angle = min(360, self.angle + angle_factor)
+                self.mark_dirty()
+            elif not self.is_width_percent() and not self.extend_mouse_values and no_stream(self.width_input_stream) and self.key_no_modifiers:
+                self.width = round_dec(self.width + self.step_size)
+                self.mark_dirty()
+            elif self.is_width_percent() and not self.extend_mouse_values and no_stream(self.percentage_input_stream) and self.key_no_modifiers:
+                self.percentage = min(100, round_dec(self.percentage + percent_factor))
+                self.mark_dirty()
+
+        if self.key_step_down:
+            if self.extend_mouse_values and no_stream(self.segments_input_stream) and self.key_no_modifiers:
+                self.segments = max(1, self.segments - segment_factor)
+                self.mark_dirty()
+            elif no_stream(self.segments_input_stream) and self.key_alt:
+                self.segments = max(1, self.segments - segment_factor)
+                self.mark_dirty()
+            elif no_stream(self.profile_input_stream) and self.key_ctrl:
+                self.profile = max(0, round_dec(self.profile - profile_factor))
+                self.mark_dirty()
+            elif no_stream(self.angle_input_stream) and self.key_ctrl_alt:
+                self.angle = max(0, self.angle - angle_factor)
+                self.mark_dirty()
+            elif not self.is_width_percent() and not self.extend_mouse_values and no_stream(self.width_input_stream) and self.key_no_modifiers:
+                self.width = max(0, round_dec(self.width - self.step_size))
+                self.mark_dirty()
+            elif self.is_width_percent() and not self.extend_mouse_values and no_stream(self.percentage_input_stream) and self.key_no_modifiers:
+                self.percentage = max(0, round_dec(self.percentage - percent_factor))
+                self.mark_dirty()
+
+        if get_preferences().enable_mouse_values:
+            if no_stream(self.segments_input_stream) and self.key_alt and self.has_mouse_step:
+                self.segments = max(1, self.segments + self.mouse_step)
+                self.mark_dirty()
+            elif no_stream(self.profile_input_stream) and self.key_ctrl:
+                self.profile = max(0, min(1, self.profile + self.mouse_value))
+                self.mark_dirty()
+            elif no_stream(self.angle_input_stream) and self.key_ctrl_alt:
+                self.angle = self.angle = max(0, min(360, self.angle + self.mouse_value_mag))
+                self.mark_dirty()
+            elif not self.is_width_percent() and no_stream(self.width_input_stream) and self.key_no_modifiers:
+                self.width = max(0, self.width + self.mouse_value)
+                self.mark_dirty()
+            elif self.is_width_percent() and no_stream(self.percentage_input_stream) and self.key_no_modifiers:
+                self.percentage = max(0, min(100, self.percentage + self.mouse_value_mag))
+                self.mark_dirty()
+
+
+    def do_invoke(self, context, event):
+        if context.active_object is None:
+            self.report({'INFO'}, "No active target object selected.")
+            return {'CANCELLED'}
+
+        self.mods = context.active_object.modifiers
+        self.mod_names = list(map(lambda x: x.name, self.mods))
+        self.current_bevel_mods = list(filter(lambda x: any(m in x for m in mod_summon_list), self.mod_names))
+
+        if event.ctrl:
+            if len(self.current_bevel_mods) == 0:
+                return {'FINISHED'}
+
+            last_bevel_mod = self.current_bevel_mods[-1] if self.current_bevel_mods else None
+
+            if last_bevel_mod == None:
+                return {'FINISHED'}
+
+            last_bevel_mod_tail = last_bevel_mod.split(' — ')[-1]
+
+            remove_modifiers_ending_with(context.selected_objects, f'Bevel — {last_bevel_mod_tail}', True)
+            remove_modifiers_ending_with(context.selected_objects, f'Weld — {last_bevel_mod_tail}', True)
+
+            return {'FINISHED'}
+
+        self.stacked = event.shift
+        self.segments = 1
+        self.width_types = ['OFFSET', 'WIDTH', 'DEPTH', 'PERCENT', 'ABSOLUTE']
+        self.width_type = self.width_types.index('WIDTH')
+        self.width = 0
+        self.percentage = 0
+        self.profile = 0.5
+        self.angle = int(get_preferences().default_smoothing_angle)
+        self.harden_normals = False
+        self.loop_slide = False
+        self.clamp_overlap = False
+
+        self.segments_input_stream = new_stream()
+        self.width_input_stream = new_stream()
+        self.percentage_input_stream = new_stream()
+        self.profile_input_stream = new_stream()
+        self.angle_input_stream = new_stream()
+
+        self.target_object = context.active_object
+        self.summoned_mod_index = 0
+
+        previous_op = all(m in self.mod_names for m in mod_summon_list)
+
+        if not self.stacked and previous_op:
+            self.summon_old_operator(context)
+        else:
+            self.prepare_new_operator(context)
+
+        self.operate(context)
+
+        capture_modifier_keys(self, None, event.mouse_x)
+
+        init_overlay(self, event)
+        register_draw_handler(self, draw_text_callback)
+
+        context.window_manager.modal_handler_add(self)
+
+        return {'RUNNING_MODAL'}
+
+
+    def handle_toggle_harden_normals(self, context, event):
+        self.harden_normals = not self.harden_normals
+
+
+    def handle_toggle_clamp_overlap(self, context, event):
+        self.clamp_overlap = not self.clamp_overlap
+
+
+    def handle_toggle_loop_slide(self, context, event):
+        self.loop_slide = not self.loop_slide
+
+
+    def handle_toggle_enhanced_wireframe(self, context, event):
+        self.target_object.show_wire = not self.target_object.show_wire
+        self.target_object.show_in_front = not self.target_object.show_in_front
+
+
+    def handle_cycle_width_type(self, context, event):
+        self.width_type = (self.width_type + 1) % len(self.width_types)
+
+
+    def handle_recall_previous_bevel(self, context, event):
+        if len(self.current_bevel_mods) <= 1:
+            return
+
+        self.summoned_mod_index = (self.summoned_mod_index + 1) % len(self.current_bevel_mods)
+        self.revert(context, True)
+        self.summon_old_operator(context)
+
+
+    def prepare_new_operator(self, context):
+        self.summoned = False
+
+        self.add_smooth_shading(context)
+        self.add_bevel_modifier(context)
+
+        ensure_tail_mod_consistency(self.target_object)
+
+
+    def summon_old_operator(self, context):
+        self.summoned = True
+
+        mod_name = self.current_bevel_mods[self.summoned_mod_index]
+        self.bevel = self.mods[mod_name]
+
+        self.width_type_prev = self.width_type = self.width_types.index(self.bevel.offset_type)
+        self.width_prev = self.width = self.bevel.width
+        self.percentage_prev = self.percentage = self.bevel.width_pct
+        self.segments_prev = self.segments = self.bevel.segments
+        self.profile_prev = self.profile = self.bevel.profile
+        self.harden_normals_prev = self.harden_normals = self.bevel.harden_normals
+        self.loop_slide_prev = self.loop_slide = self.bevel.loop_slide
+        self.clamp_overlap_prev = self.clamp_overlap = self.bevel.use_clamp_overlap
+        self.angle_prev = self.angle = degrees(self.bevel.angle_limit)
+
+        if get_preferences().lock_overlay_parameters_on_recall:
+            self.segments_input_stream = set_stream(self.segments)
+            self.width_input_stream = set_stream(self.width)
+            self.percentage_input_stream = set_stream(self.percentage)
+            self.profile_input_stream = set_stream(self.profile)
+            self.angle_input_stream = set_stream(self.angle)
+
+
+    def add_smooth_shading(self, context):
+        if not get_preferences().enable_auto_smooth:
+            return
+
+        if app_minor_version() >= (4, 1):
+            add_smooth_by_angle(context, self.target_object)
+            return
+
+        bpy.ops.object.shade_smooth()
+        self.target_object.data.use_auto_smooth = True
+        self.target_object.data.auto_smooth_angle = radians(float(get_preferences().default_smoothing_angle))
+
+
+    def add_bevel_modifier(self, context):
+        bevel = new_modifier(self.target_object, mod_bevel, 'BEVEL', rectify=False)
+        bevel.offset_type = 'WIDTH'
+        bevel.miter_outer = 'MITER_ARC'
+        bevel.face_strength_mode = 'FSTR_AFFECTED'
+
+        self.bevel = bevel
+
+
+    def add_weld_modifier(self, context):
+        weld = new_modifier(self.target_object, mod_weld, 'WELD', rectify=False)
+        weld.merge_threshold = 0.00001
+        weld.mode = 'CONNECTED'
+
+        self.weld = weld
+
+
+    def is_width_percent(self):
+        return self.width_type == self.width_types.index('PERCENT')
+
+
+    def operate(self, context):
+        self.bevel.offset_type = self.width_types[self.width_type]
+
+        final_width = self.percentage if self.is_width_percent() else self.width
+        self.bevel.width_pct = final_width
+        self.bevel.width = final_width
+
+        self.bevel.segments = self.segments
+        self.bevel.profile = self.profile
+        self.bevel.harden_normals = self.harden_normals
+        self.bevel.angle_limit = radians(self.angle)
+        self.bevel.loop_slide = self.loop_slide
+        self.bevel.use_clamp_overlap = self.clamp_overlap
+
+
+    def finish(self, context):
+        self.target_object.show_wire = False
+        self.target_object.show_in_front = False
+
+        if not self.summoned:
+            self.add_weld_modifier(context)
+            ensure_tail_mod_consistency(self.target_object)
+
+        unregister_draw_handler()
+
+
+    def revert(self, context, soft=False):
+        self.target_object.show_wire = False
+        self.target_object.show_in_front = False
+
+        if not self.summoned:
+            bpy.ops.object.modifier_remove(modifier=self.bevel.name)
+
+        if self.summoned:
+            self.bevel.offset_type = self.width_types[self.width_type_prev]
+            self.bevel.width = self.width_prev
+            self.bevel.width_pct = self.percentage_prev
+            self.bevel.segments = self.segments_prev
+            self.bevel.profile = self.profile_prev
+            self.bevel.angle_limit = radians(self.angle_prev)
+            self.bevel.loop_slide = self.loop_slide_prev
+            self.bevel.use_clamp_overlap = self.clamp_overlap_prev
+
+        if not soft:
+            unregister_draw_handler()
+
+
+def draw_text_callback(self):
+    draw_header(self)
+
+    if self.is_width_percent():
+        draw_property(
+            self,
+            f"Percentage: {self.percentage:.2f}%",
+            self.generate_step_hint(10, 1),
+            active=self.key_no_modifiers,
+            alt_mode=self.key_shift_no_modifiers,
+            mouse_value=True,
+            input_stream=self.percentage_input_stream)
+    else:
+        draw_property(
+            self,
+            f"{self.width_types[self.width_type].capitalize()}: {(self.width * self.display_unit_scale):.2f}{self.unit_suffix}",
+            self.unit_step_hint,
+            active=self.key_no_modifiers,
+            alt_mode=self.key_shift_no_modifiers,
+            mouse_value=True,
+            input_stream=self.width_input_stream)
+
+    draw_property(
+        self,
+        f"Segments: {self.segments}",
+        self.generate_key_hint("Alt / Scroll" if self.extend_mouse_values else "Alt", self.generate_step_hint(2, 1)),
+        active=self.key_alt,
+        alt_mode=self.key_shift_alt,
+        mouse_value=True,
+        input_stream=self.segments_input_stream)
+
+    draw_property(
+        self,
+        f"Profile: {self.profile:.2f}",
+        self.generate_key_hint("Ctrl", self.generate_step_hint(0.1, 0.01)),
+        active=self.key_ctrl,
+        alt_mode=self.key_shift_ctrl,
+        mouse_value=True,
+        input_stream=self.profile_input_stream)
+
+    draw_property(
+        self,
+        f"Angle: {self.angle:.0f}°",
+        self.generate_key_hint("Ctrl + Alt", self.generate_step_hint(15, 1)),
+        active=self.key_ctrl_alt,
+        alt_mode=self.key_shift_ctrl_alt,
+        mouse_value=True,
+        input_stream=self.angle_input_stream)
+
+    draw_hint(
+        self,
+        f"Width Type [W]: {self.width_types[self.width_type].capitalize()}",
+        self.list_options_str(self.width_types))
+
+    draw_hint(
+        self,
+        f"Harden Normals [H]: {self.yes_no_str(self.harden_normals)}",
+        "Match normals of new faces to adjacent faces")
+
+    draw_hint(
+        self,
+        f"Enhanced Wireframe [E]: {self.yes_no_str(self.target_object.show_wire)}",
+        "Display the object's wireframe over solid shading")
+
+    draw_hint(
+        self,
+        f"Clamp Overlap [C]: {self.yes_no_str(self.clamp_overlap)}",
+        "Clamp the width to avoid overlap")
+
+    draw_hint(
+        self,
+        f"Loop Slide [S]: {self.yes_no_str(self.loop_slide)}",
+        "Prefer sliding along edges to having even widths")
+
+    if len(self.current_bevel_mods) > 1:
+        draw_hint(
+            self,
+            f"Recall bevel [R]: {self.current_bevel_mods[self.summoned_mod_index]}",
+            "Switch between summoned bevels")
+
+
+def register():
+    bpy.utils.register_class(ND_OT_bevel)
+
+
+def unregister():
+    bpy.utils.unregister_class(ND_OT_bevel)
+    unregister_draw_handler()
