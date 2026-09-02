@@ -293,7 +293,17 @@ def clean_mesh(context, obj, merge_distance, remove_interior):
         bpy.ops.mesh.normals_make_consistent(inside=False)
         bpy.ops.object.mode_set(mode='OBJECT')
 
-    return removed_verts - len(obj.data.vertices), removed_faces - len(obj.data.polygons)
+    # Count what survived. An open edge here means the mesh about to be written
+    # still has a hole in it, which is worth saying out loud at the point of
+    # export rather than leaving to be discovered in the engine.
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    open_edges = sum(1 for edge in bm.edges if len(edge.link_faces) != 2)
+    bm.free()
+
+    return (removed_verts - len(obj.data.vertices),
+            removed_faces - len(obj.data.polygons),
+            open_edges)
 
 
 def mesh_bounds(mesh, matrix, skip_loose=True):
@@ -973,6 +983,103 @@ def resolve_array_axis(context, mode):
     axis = Vector((0.0, 0.0, 0.0))
     axis["XYZ".index(mode)] = 1.0
     return axis
+
+
+def face_planarity(face):
+    """How far a face bends out of its own plane, relative to its size.
+
+    Relative rather than absolute so one threshold works on a two metre crate
+    side and a two millimetre detail alike. Measured against real geometry, a
+    planar face lands under 1e-7 while a face spanning a cylinder wall lands
+    between 1e-2 and 1e-1, so the two are never close to being confused.
+    """
+    if len(face.verts) < 4:
+        return 0.0
+
+    centre = face.calc_center_median()
+    normal = face.normal
+    extent = max((vert.co - centre).length for vert in face.verts)
+    if extent < 1e-12:
+        return 0.0
+    return max(abs((vert.co - centre).dot(normal)) for vert in face.verts) / extent
+
+
+def diagnose_mesh(bm, planar_tolerance=1e-4, include_quads=False):
+    """Everything about a mesh that would upset an engine, without changing it."""
+    bm.normal_update()
+
+    curved = [face for face in bm.faces
+              if (len(face.verts) > 4 or (include_quads and len(face.verts) == 4))
+              and face_planarity(face) > planar_tolerance]
+    curved_set = set(curved)
+
+    return {
+        "loose_verts": [v for v in bm.verts if not v.link_faces and not v.link_edges],
+        "wire_edges": [e for e in bm.edges if not e.link_faces],
+        # One face means an open edge: a hole, or a boolean that never capped.
+        "holes": [e for e in bm.edges if len(e.link_faces) == 1],
+        # Three or more means surfaces meeting along a seam, which is what
+        # breaks a triangulator's idea of inside and outside.
+        "junctions": [e for e in bm.edges if len(e.link_faces) > 2],
+        "interior_faces": [f for f in bm.faces
+                           if f.edges and all(len(e.link_faces) > 2 for e in f.edges)],
+        "zero_area_faces": [f for f in bm.faces if f.calc_area() < 1e-12],
+        "curved_ngons": curved,
+        "flat_ngons": [f for f in bm.faces
+                       if len(f.verts) > 4 and f not in curved_set],
+    }
+
+
+def sanitize_mesh(bm, merge_distance, dissolve_degenerate, remove_loose,
+                  remove_interior, triangulate_curved, planar_tolerance,
+                  include_quads):
+    """Apply the safe fixes, in the order that stops one undoing another.
+
+    Welding first collapses the micro-geometry that would otherwise be counted
+    as real faces; interior faces go before loose geometry because deleting
+    them strands vertices; triangulation goes last so it only ever sees the
+    faces that survived.
+    """
+    removed = {}
+    before_verts, before_faces = len(bm.verts), len(bm.faces)
+
+    if merge_distance > 0.0:
+        bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=merge_distance)
+    if dissolve_degenerate and merge_distance > 0.0:
+        bmesh.ops.dissolve_degenerate(bm, dist=merge_distance, edges=bm.edges[:])
+    removed["welded_verts"] = before_verts - len(bm.verts)
+
+    if remove_interior:
+        bm.normal_update()
+        interior = [f for f in bm.faces
+                    if f.edges and all(len(e.link_faces) > 2 for e in f.edges)]
+        removed["interior_faces"] = len(interior)
+        if interior:
+            bmesh.ops.delete(bm, geom=interior, context='FACES')
+    else:
+        removed["interior_faces"] = 0
+
+    if remove_loose:
+        stray = [v for v in bm.verts if not v.link_faces]
+        removed["loose_verts"] = len(stray)
+        if stray:
+            bmesh.ops.delete(bm, geom=stray, context='VERTS')
+    else:
+        removed["loose_verts"] = 0
+
+    removed["triangulated"] = 0
+    if triangulate_curved:
+        bm.normal_update()
+        curved = [face for face in bm.faces
+                  if (len(face.verts) > 4 or (include_quads and len(face.verts) == 4))
+                  and face_planarity(face) > planar_tolerance]
+        removed["triangulated"] = len(curved)
+        if curved:
+            bmesh.ops.triangulate(bm, faces=curved)
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    removed["faces_delta"] = len(bm.faces) - before_faces
+    return removed
 
 
 def sanitize_filename(name):
@@ -2131,6 +2238,146 @@ class OBJECT_OT_smart_uv(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OBJECT_OT_preflight_scan(bpy.types.Operator):
+    """Check and clean a mesh before it goes to the engine"""
+    bl_idname = "object.preflight_scan"
+    bl_label = "Scan & Sanitize"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    report_only: BoolProperty(
+        name="Report Only",
+        description="Measure the mesh without touching it. Worth a first pass on "
+                    "a finished asset before anything is allowed to change it",
+        default=False,
+    )
+    merge_distance: FloatProperty(
+        name="Merge Distance",
+        description="Vertices closer than this are welded, and edges shorter "
+                    "than this are dissolved",
+        default=0.0001, min=0.0, max=0.1, precision=5, step=0.001, subtype='DISTANCE',
+    )
+    remove_loose: BoolProperty(name="Remove Loose Geometry", default=True)
+    remove_interior: BoolProperty(name="Remove Interior Faces", default=True)
+    triangulate_curved: BoolProperty(
+        name="Triangulate Curved Ngons",
+        description="Triangulate only the ngons that bend. Flat ngons are left "
+                    "whole: an engine triangulates those the same way whatever "
+                    "it does, and keeping them keeps the wireframe readable",
+        default=True,
+    )
+    planar_tolerance: FloatProperty(
+        name="Flatness Tolerance",
+        description="How far a face may bend, relative to its size, and still "
+                    "count as flat",
+        default=0.0001, min=0.0, max=1.0, precision=6, step=0.01,
+    )
+    include_quads: BoolProperty(
+        name="Include Quads",
+        description="Also triangulate quads that bend. Off by default: a warped "
+                    "quad is far more common than a warped ngon and turning them "
+                    "all into triangles doubles the count for little gain",
+        default=False,
+    )
+    select_issues: BoolProperty(
+        name="Select What Is Left",
+        description="Select any holes and non-manifold seams that survived and "
+                    "drop into Edit Mode to look at them",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
+
+    def execute(self, context):
+        meshes = selected_meshes(context)
+        if not meshes:
+            self.report({'ERROR'}, "Select at least one mesh.")
+            return {'CANCELLED'}
+
+        totals = {}
+        remaining = {}
+        for obj in meshes:
+            if obj.data.users > 1:
+                self.report({'WARNING'}, f"Skipped {obj.name}: mesh data is shared.")
+                continue
+            for key, value in self.process(obj).items():
+                target = remaining if key.startswith("left_") else totals
+                target[key] = target.get(key, 0) + value
+
+        summary = self.describe(totals, remaining)
+        for obj in meshes:
+            obj["preflight_report"] = summary
+
+        blocked = sum(remaining.values())
+        if blocked and self.select_issues and not self.report_only:
+            bpy.ops.object.mode_set(mode='EDIT')
+            context.tool_settings.mesh_select_mode = (False, True, False)
+
+        self.report({'WARNING'} if blocked else {'INFO'}, summary)
+        return {'FINISHED'}
+
+    def process(self, obj):
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+
+        counts = {}
+        if self.report_only:
+            found = diagnose_mesh(bm, self.planar_tolerance, self.include_quads)
+            counts.update({
+                "loose_verts": len(found["loose_verts"]),
+                "interior_faces": len(found["interior_faces"]),
+                "triangulated": len(found["curved_ngons"]),
+                "welded_verts": 0,
+            })
+        else:
+            counts.update(sanitize_mesh(
+                bm, self.merge_distance, True, self.remove_loose,
+                self.remove_interior, self.triangulate_curved,
+                self.planar_tolerance, self.include_quads))
+
+        # What survived is what a person has to look at: an open hole cannot be
+        # closed safely without knowing what the asset is meant to be.
+        left = diagnose_mesh(bm, self.planar_tolerance, self.include_quads)
+        counts["left_holes"] = len(left["holes"])
+        counts["left_junctions"] = len(left["junctions"])
+
+        if self.select_issues and not self.report_only:
+            for element in bm.verts, bm.edges, bm.faces:
+                for item in element:
+                    item.select_set(False)
+            for edge in left["holes"] + left["junctions"]:
+                edge.select_set(True)
+
+        if not self.report_only:
+            bm.to_mesh(obj.data)
+            obj.data.update()
+        bm.free()
+        return counts
+
+    @staticmethod
+    def describe(totals, remaining):
+        parts = []
+        labels = (("welded_verts", "welded"), ("loose_verts", "loose"),
+                  ("interior_faces", "interior faces"), ("triangulated", "ngons split"))
+        for key, label in labels:
+            if totals.get(key):
+                parts.append(f"{totals[key]} {label}")
+
+        blockers = []
+        if remaining.get("left_holes"):
+            blockers.append(f"{remaining['left_holes']} open edges")
+        if remaining.get("left_junctions"):
+            blockers.append(f"{remaining['left_junctions']} non-manifold seams")
+
+        if blockers:
+            return (", ".join(parts) + " | " if parts else "") + \
+                   "needs a look: " + ", ".join(blockers)
+        return ", ".join(parts) if parts else "Clean"
+
+
 # --- UE5 EXPORT PIPELINE -------------------------------------------------------
 
 class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
@@ -2175,17 +2422,21 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
         written = 0
         cleaned_verts = 0
         cleaned_faces = 0
+        leaky = []
         for source in sources:
             name = self.asset_name(source.name)
             temp = self.build_export_copy(context, source, name, scene.smart_export_origin)
             try:
                 # Clean before unwrapping: the UVs must describe the final mesh.
                 if scene.smart_export_clean:
-                    verts, faces = clean_mesh(context, temp,
-                                              scene.smart_export_merge_distance,
-                                              scene.smart_export_remove_interior)
+                    verts, faces, open_edges = clean_mesh(
+                        context, temp,
+                        scene.smart_export_merge_distance,
+                        scene.smart_export_remove_interior)
                     cleaned_verts += verts
                     cleaned_faces += faces
+                    if open_edges:
+                        leaky.append(f"{source.name} ({open_edges})")
 
                 # High poly is a bake source only, so it never needs UVs. A
                 # curve already carries the straight strip UV Blender generates
@@ -2201,6 +2452,12 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                 mesh = temp.data
                 bpy.data.objects.remove(temp, do_unlink=True)
                 bpy.data.meshes.remove(mesh)
+
+        if leaky:
+            self.report({'WARNING'},
+                        "Exported with open edges, so these are not watertight: "
+                        + ", ".join(leaky[:4])
+                        + ". Run Scan & Sanitize to find them.")
 
         summary = f"Exported {written} FBX file(s) to {export_dir}"
         if cleaned_verts or cleaned_faces:
@@ -2367,6 +2624,19 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
 
         layout.separator()
 
+        layout.label(text="Pre-flight:", icon='CHECKMARK')
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        col.operator(OBJECT_OT_preflight_scan.bl_idname, text="Scan & Sanitize")
+        active = context.active_object
+        if active is not None and active.get("preflight_report"):
+            note = layout.row()
+            report = active["preflight_report"]
+            note.alert = "needs a look" in report
+            note.label(text=report, icon='INFO')
+
+        layout.separator()
+
         layout.label(text="UE5 Pipeline:", icon='EXPORT')
         if abs(context.scene.unit_settings.scale_length - 1.0) > 1e-6:
             warning = layout.box()
@@ -2517,6 +2787,7 @@ classes = (
     OBJECT_OT_smart_bevel,
     OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
+    OBJECT_OT_preflight_scan,
     OBJECT_OT_smart_export_ue5,
     VIEW3D_PT_smart_tools,
 )
