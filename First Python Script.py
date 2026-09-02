@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Smart Hard Surface Tools",
     "author": "Niall",
-    "version": (1, 8),
+    "version": (1, 9),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar (N) > Addon Test",
     "description": "Automates booleans, shading, UVs, and UE5 exporting.",
@@ -40,8 +40,8 @@ TRIANGULATE_MOD = "Smart_Triangulate"
 # every one of them inherits the corner's weight, and the vertex bevel then
 # rounds each in place: a measured 342 zero-area faces out of 548 on a single
 # weighted cube corner. Rounding the raw corner first gives 146 clean faces.
-POST_BOOLEAN_STACK = (WELD_MOD, VERTEX_BEVEL_MOD, BEVEL_MOD,
-                      WEIGHTED_NORMAL_MOD, TRIANGULATE_MOD)
+POST_BOOLEAN_HEAD = (WELD_MOD, VERTEX_BEVEL_MOD, BEVEL_MOD)
+POST_BOOLEAN_TAIL = (WEIGHTED_NORMAL_MOD, TRIANGULATE_MOD)
 POST_BOOLEAN_TYPES = {'WELD', 'BEVEL', 'WEIGHTED_NORMAL', 'TRIANGULATE'}
 
 INVALID_FILENAME_CHARS = set('\\/:*?"<>|')
@@ -53,6 +53,13 @@ DUPLICATE_SUFFIX = re.compile(r"\.\d{3}$")
 # dedicated field on the element.
 EDGE_WEIGHT_ATTR = "bevel_weight_edge"
 VERT_WEIGHT_ATTR = "bevel_weight_vert"
+
+# A bevel layer is one bevel modifier bound to its own edge attribute, so a
+# mesh can carry several at different widths at once. Blender suffixes both
+# names on collision, and the modifier's edge_weight field is what ties a
+# given modifier back to its own attribute.
+BEVEL_LAYER_MOD = "Smart_Bevel_Layer"
+BEVEL_LAYER_ATTR = "Smart_Bevel_Edge"
 
 
 def _boolean_solver_items():
@@ -249,13 +256,25 @@ def ensure_weld(obj, merge_distance, connected_only=True):
     return weld
 
 
+def post_boolean_order(obj):
+    """The tail modifiers for this object, in the order they must evaluate.
+
+    Bevel layers sit between the main bevel and the weighted normal, and are
+    kept in the order they already appear so that re-sorting never reshuffles
+    layers the artist has arranged.
+    """
+    return (list(POST_BOOLEAN_HEAD)
+            + [modifier.name for modifier in obj.modifiers if is_bevel_layer(modifier)]
+            + list(POST_BOOLEAN_TAIL))
+
+
 def sort_post_boolean_stack(obj):
-    """Force weld -> bevel -> weighted normal to the tail of the stack, in order.
+    """Force weld -> bevels -> weighted normal to the tail of the stack, in order.
 
     Moving each to the end in sequence leaves them correctly ordered relative to
     one another and after every boolean, whatever order they were created in.
     """
-    for name in POST_BOOLEAN_STACK:
+    for name in post_boolean_order(obj):
         index = obj.modifiers.find(name)
         if index != -1:
             obj.modifiers.move(index, len(obj.modifiers) - 1)
@@ -398,7 +417,7 @@ def face_alignment_matrix(obj, faces, active_face):
 
 
 def is_smart_bevel(modifier):
-    """Only modifiers this addon created, edge and vertex bevels alike.
+    """Only modifiers this addon created: edge, vertex and layer bevels alike.
 
     Type is checked alongside the name so a hand-built modifier that merely
     starts with the same word is never touched, and startswith covers the
@@ -406,6 +425,48 @@ def is_smart_bevel(modifier):
     """
     return (modifier.type == 'BEVEL'
             and modifier.name.startswith((BEVEL_MOD, VERTEX_BEVEL_MOD)))
+
+
+def is_bevel_layer(modifier):
+    """A bevel bound to its own edge attribute rather than the shared weight."""
+    return modifier.type == 'BEVEL' and modifier.name.startswith(BEVEL_LAYER_MOD)
+
+
+def bevel_layers(obj):
+    """Every bevel layer on an object, in stack order."""
+    return [modifier for modifier in obj.modifiers if is_bevel_layer(modifier)]
+
+
+def layer_attribute(obj, modifier):
+    """The edge attribute a bevel layer reads, or None if it has been lost.
+
+    The modifier's own edge_weight field is the link, so renaming an attribute
+    in the spreadsheet breaks the pair loudly rather than silently bevelling
+    the wrong edges.
+    """
+    name = getattr(modifier, "edge_weight", "")
+    attribute = obj.data.attributes.get(name) if name else None
+    if attribute is not None and attribute.domain == 'EDGE':
+        return attribute
+    return None
+
+
+def tune_bevel(modifier, width):
+    """Common setup every Smart Bevel shares.
+
+    offset_type is WIDTH rather than Blender's default OFFSET so the number in
+    the panel is the width of the chamfer strip itself. At 0.2 on a cube,
+    OFFSET cuts 0.2 into each face and leaves a strip 0.283 across; WIDTH gives
+    a strip exactly 0.2 across. For a pipeline where a chamfer is specified in
+    millimetres, that is the number the artist actually means.
+
+    face_strength_mode marks the bevel's own faces weak so the Weighted Normal
+    modifier can ignore them.
+    """
+    modifier.offset_type = 'WIDTH'
+    modifier.width = width
+    if hasattr(modifier, "face_strength_mode"):
+        modifier.face_strength_mode = 'FSTR_AFFECTED'
 
 
 def bevel_weight_layer(bm, domain):
@@ -2360,10 +2421,10 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
         bevel = obj.modifiers.get(BEVEL_MOD) or obj.modifiers.new(name=BEVEL_MOD, type='BEVEL')
         bevel.limit_method = self.limit_mode
         bevel.angle_limit = self.sharp_angle
-        bevel.width = self.bevel_width
         bevel.segments = self.bevel_segments
         bevel.profile = 0.7
         bevel.miter_outer = 'MITER_ARC'
+        tune_bevel(bevel, self.bevel_width)
         if hasattr(bevel, "edge_weight"):
             bevel.edge_weight = EDGE_WEIGHT_ATTR
 
@@ -2374,8 +2435,8 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
             # Weight driven rather than every corner: bevelling all of them at
             # once is almost never what a hard-surface piece wants.
             corner.limit_method = 'WEIGHT'
-            corner.width = self.vertex_width
             corner.segments = self.bevel_segments
+            tune_bevel(corner, self.vertex_width)
             if hasattr(corner, "vertex_weight"):
                 corner.vertex_weight = VERT_WEIGHT_ATTR
         elif existing is not None:
@@ -2384,6 +2445,13 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
         weighted_normal = (obj.modifiers.get(WEIGHTED_NORMAL_MOD)
                            or obj.modifiers.new(name=WEIGHTED_NORMAL_MOD, type='WEIGHTED_NORMAL'))
         weighted_normal.keep_sharp = True
+        # Pairs with the bevels' face strength: the narrow bevel strips are
+        # marked weak, so the wide flat faces around them decide the normal.
+        # Measured on a cube with a raised inset panel, this took the mesh from
+        # 97 distinct loop normals to 57 -- the strips stop dragging the flat
+        # faces out of true, which is the usual cause of smeared edge shading.
+        if hasattr(weighted_normal, "use_face_influence"):
+            weighted_normal.use_face_influence = True
 
         # Keeps weld -> vertex bevel -> bevel -> weighted normal in order at the
         # tail, after every boolean, however the user built the stack up.
@@ -2433,6 +2501,134 @@ class MESH_OT_set_bevel_weight(bpy.types.Operator):
         bmesh.update_edit_mesh(obj.data)
         self.report({'INFO'}, f"Weight {self.weight:.2f} on {touched} "
                               f"{self.domain.lower()}(s).")
+        return {'FINISHED'}
+
+
+class MESH_OT_add_bevel_layer(bpy.types.Operator):
+    """Give the selected edges a bevel of their own, at their own width"""
+    bl_idname = "mesh.add_bevel_layer"
+    bl_label = "Bevel Selection Separately"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    width: FloatProperty(name="Width", default=0.01, min=0.0001, step=0.1,
+                         subtype='DISTANCE',
+                         description="Width of the chamfer strip itself")
+    segments: IntProperty(name="Segments", default=3, min=1, max=24)
+    profile: FloatProperty(name="Profile", default=0.7, min=0.0, max=1.0)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (context.mode == 'EDIT_MESH' and obj is not None
+                and obj.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected = [edge.index for edge in bm.edges if edge.select]
+        if not selected:
+            self.report({'ERROR'}, "Select the edges this bevel should affect.")
+            return {'CANCELLED'}
+
+        # Attributes cannot be added to a mesh that is open for editing, so the
+        # write happens in Object Mode. Indices stay valid across the hop
+        # because no topology changes in between.
+        bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            attribute = obj.data.attributes.new(BEVEL_LAYER_ATTR, 'FLOAT', 'EDGE')
+            for index in selected:
+                attribute.data[index].value = 1.0
+
+            bevel = obj.modifiers.new(name=BEVEL_LAYER_MOD, type='BEVEL')
+            bevel.limit_method = 'WEIGHT'
+            bevel.edge_weight = attribute.name
+            bevel.segments = self.segments
+            bevel.profile = self.profile
+            bevel.miter_outer = 'MITER_ARC'
+            tune_bevel(bevel, self.width)
+            sort_post_boolean_stack(obj)
+        finally:
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        self.report({'INFO'}, f"{bevel.name} on {len(selected)} edge(s).")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_remove_bevel_layer(bpy.types.Operator):
+    """Delete this bevel layer and the edge attribute that drives it"""
+    bl_idname = "object.remove_bevel_layer"
+    bl_label = "Remove Bevel Layer"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    modifier_name: StringProperty(name="Modifier")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        modifier = obj.modifiers.get(self.modifier_name)
+        if modifier is None or not is_bevel_layer(modifier):
+            self.report({'ERROR'}, f"No bevel layer named {self.modifier_name}.")
+            return {'CANCELLED'}
+
+        # The attribute goes with it. Leaving it behind would quietly grow the
+        # mesh a dead float per edge for every layer ever removed.
+        attribute = layer_attribute(obj, modifier)
+        obj.modifiers.remove(modifier)
+        if attribute is not None:
+            obj.data.attributes.remove(attribute)
+
+        self.report({'INFO'}, f"Removed {self.modifier_name}.")
+        return {'FINISHED'}
+
+
+class MESH_OT_assign_bevel_layer(bpy.types.Operator):
+    """Add or remove the selected edges from an existing bevel layer"""
+    bl_idname = "mesh.assign_bevel_layer"
+    bl_label = "Assign To Bevel Layer"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    modifier_name: StringProperty(name="Modifier")
+    remove: BoolProperty(name="Remove", default=False)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (context.mode == 'EDIT_MESH' and obj is not None
+                and obj.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+        modifier = obj.modifiers.get(self.modifier_name)
+        if modifier is None or not is_bevel_layer(modifier):
+            self.report({'ERROR'}, f"No bevel layer named {self.modifier_name}.")
+            return {'CANCELLED'}
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected = [edge.index for edge in bm.edges if edge.select]
+        if not selected:
+            self.report({'ERROR'}, "Nothing selected.")
+            return {'CANCELLED'}
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            attribute = layer_attribute(obj, modifier)
+            if attribute is None:
+                self.report({'ERROR'},
+                            f"{self.modifier_name} has lost its edge attribute.")
+                return {'CANCELLED'}
+            value = 0.0 if self.remove else 1.0
+            for index in selected:
+                attribute.data[index].value = value
+        finally:
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        verb = "Removed" if self.remove else "Added"
+        self.report({'INFO'}, f"{verb} {len(selected)} edge(s).")
         return {'FINISHED'}
 
 
@@ -3147,6 +3343,7 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.operator(OBJECT_OT_smart_bevel.bl_idname, text="Smart Bevel")
 
         self.draw_live_bevel(context, layout)
+        self.draw_bevel_layers(context, layout)
         self.draw_bevel_resolution(context, layout)
 
         layout.separator()
@@ -3282,6 +3479,59 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
             hint.enabled = False
             hint.label(text="Tab into Edit Mode to dial individual edges", icon='INFO')
 
+    @staticmethod
+    def draw_bevel_layers(context, layout):
+        """One box per bevel layer, each with its own width and segments.
+
+        Drawn from the modifiers themselves, so the widgets are live: this is
+        the whole point of layers over a single shared weight, which can only
+        scale one width up and down.
+        """
+        active = context.active_object
+        if active is None or active.type != 'MESH':
+            return
+
+        layers = bevel_layers(active)
+        box = layout.box()
+        row = box.row(align=True)
+        row.label(text=f"Bevel Layers ({len(layers)})", icon='MOD_BEVEL')
+
+        if context.mode == 'EDIT_MESH':
+            box.operator(MESH_OT_add_bevel_layer.bl_idname,
+                         text="Bevel Selection Separately", icon='ADD')
+        elif not layers:
+            hint = box.row()
+            hint.enabled = False
+            hint.label(text="Tab into Edit Mode to add one", icon='INFO')
+
+        for modifier in layers:
+            sub = box.box()
+            header = sub.row(align=True)
+            header.prop(modifier, "show_viewport", text="")
+            header.label(text=modifier.name.replace(BEVEL_LAYER_MOD, "Layer"))
+            header.operator(OBJECT_OT_remove_bevel_layer.bl_idname,
+                            text="", icon='X').modifier_name = modifier.name
+
+            if layer_attribute(active, modifier) is None:
+                warn = sub.row()
+                warn.alert = True
+                warn.label(text="Edge attribute missing", icon='ERROR')
+                continue
+
+            column = sub.column(align=True)
+            column.prop(modifier, "width")
+            column.prop(modifier, "segments")
+            column.prop(modifier, "profile")
+
+            if context.mode == 'EDIT_MESH':
+                row = sub.row(align=True)
+                add = row.operator(MESH_OT_assign_bevel_layer.bl_idname, text="Assign")
+                add.modifier_name = modifier.name
+                add.remove = False
+                drop = row.operator(MESH_OT_assign_bevel_layer.bl_idname, text="Remove")
+                drop.modifier_name = modifier.name
+                drop.remove = True
+
     def draw_bevel_resolution(self, context, layout):
         scene = context.scene
         box = layout.box()
@@ -3403,6 +3653,9 @@ classes = (
     MESH_OT_panel_line,
     OBJECT_OT_smart_bevel,
     MESH_OT_set_bevel_weight,
+    MESH_OT_add_bevel_layer,
+    MESH_OT_assign_bevel_layer,
+    OBJECT_OT_remove_bevel_layer,
     OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
     OBJECT_OT_preflight_scan,
