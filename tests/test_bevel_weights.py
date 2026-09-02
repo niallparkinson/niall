@@ -82,8 +82,9 @@ bpy.ops.mesh.primitive_cube_add(size=2.0); cube=bpy.context.active_object
 bpy.ops.object.smart_bevel(limit_mode='WEIGHT', vertex_bevel=True, vertex_width=0.15)
 names=[m.name for m in cube.modifiers]
 rep("vertex bevel added", H.VERTEX_BEVEL_MOD in names, str(names))
-rep("ordered before the weighted normal",
-    names.index(H.VERTEX_BEVEL_MOD) < names.index(H.WEIGHTED_NORMAL_MOD), str(names))
+rep("rounds corners before the edge bevel splits them",
+    names.index(H.VERTEX_BEVEL_MOD) < names.index(H.BEVEL_MOD) < names.index(H.WEIGHTED_NORMAL_MOD),
+    str(names))
 quiet=faces(cube)
 bm=bmesh.new(); bm.from_mesh(cube.data)
 lay=H.bevel_weight_layer(bm,'VERTEX'); bm.verts.ensure_lookup_table()
@@ -91,6 +92,15 @@ for i in range(3): bm.verts[i][lay]=1.0
 bm.to_mesh(cube.data); bm.free()
 rep("does nothing until corners are weighted", faces(cube)>quiet,
     f"{quiet} -> {faces(cube)} after weighting 3 corners")
+# Ordering regression: with the vertex bevel after the edge bevel, one weighted
+# corner collapsed 342 of 548 faces to zero area. The corner must be rounded
+# while it is still a single vertex.
+dg=bpy.context.evaluated_depsgraph_get()
+me=bpy.data.meshes.new_from_object(cube.evaluated_get(dg), preserve_all_data_layers=True, depsgraph=dg)
+bm=bmesh.new(); bm.from_mesh(me)
+degenerate=sum(1 for f in bm.faces if f.calc_area() < 1e-9)
+bm.free(); bpy.data.meshes.remove(me)
+rep("no degenerate faces at the rounded corners", degenerate==0, f"{degenerate} zero-area faces")
 bpy.ops.object.smart_bevel(limit_mode='WEIGHT', vertex_bevel=False)
 rep("toggling it off removes it", H.VERTEX_BEVEL_MOD not in [m.name for m in cube.modifiers])
 H.unregister()
