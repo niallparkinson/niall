@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Smart Hard Surface Tools",
     "author": "Niall",
-    "version": (1, 6),
+    "version": (1, 7),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar (N) > Addon Test",
     "description": "Automates booleans, shading, UVs, and UE5 exporting.",
@@ -30,15 +30,24 @@ CABLE_COLLECTION = "Cable_Rig"
 _auto_sync_suspended = False
 WELD_MOD = "Smart_Weld"
 BEVEL_MOD = "Smart_Bevel"
+VERTEX_BEVEL_MOD = "Smart_Vertex_Bevel"
 WEIGHTED_NORMAL_MOD = "Smart_Weighted_Normal"
 TRIANGULATE_MOD = "Smart_Triangulate"
 
 # Modifiers that must always evaluate after every boolean, in this order.
-POST_BOOLEAN_STACK = (WELD_MOD, BEVEL_MOD, WEIGHTED_NORMAL_MOD, TRIANGULATE_MOD)
+POST_BOOLEAN_STACK = (WELD_MOD, BEVEL_MOD, VERTEX_BEVEL_MOD,
+                      WEIGHTED_NORMAL_MOD, TRIANGULATE_MOD)
 POST_BOOLEAN_TYPES = {'WELD', 'BEVEL', 'WEIGHTED_NORMAL', 'TRIANGULATE'}
 
 INVALID_FILENAME_CHARS = set('\\/:*?"<>|')
 DUPLICATE_SUFFIX = re.compile(r"\.\d{3}$")
+
+# Blender 4.0 replaced MeshEdge.bevel_weight with generic float attributes.
+# The Bevel modifier reads them by name through its edge_weight and
+# vertex_weight fields, so they are reached as named layers, not as a
+# dedicated field on the element.
+EDGE_WEIGHT_ATTR = "bevel_weight_edge"
+VERT_WEIGHT_ATTR = "bevel_weight_vert"
 
 
 def _boolean_solver_items():
@@ -384,13 +393,25 @@ def face_alignment_matrix(obj, faces, active_face):
 
 
 def is_smart_bevel(modifier):
-    """Only modifiers this addon created.
+    """Only modifiers this addon created, edge and vertex bevels alike.
 
     Type is checked alongside the name so a hand-built modifier that merely
     starts with the same word is never touched, and startswith covers the
     Smart_Bevel.001 Blender produces on some duplications.
     """
-    return modifier.type == 'BEVEL' and modifier.name.startswith(BEVEL_MOD)
+    return (modifier.type == 'BEVEL'
+            and modifier.name.startswith((BEVEL_MOD, VERTEX_BEVEL_MOD)))
+
+
+def bevel_weight_layer(bm, domain):
+    """The bevel weight float layer for a domain, created if missing."""
+    if domain == 'EDGE':
+        layers, name = bm.edges.layers.float, EDGE_WEIGHT_ATTR
+    else:
+        layers, name = bm.verts.layers.float, VERT_WEIGHT_ATTR
+
+    layer = layers.get(name)
+    return layer if layer is not None else layers.new(name)
 
 
 def iter_smart_bevels(scene, view_layer, selected_only):
@@ -2239,11 +2260,36 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
     bevel_width: FloatProperty(name="Bevel Width", default=0.01, min=0.001, step=0.1)
     bevel_segments: IntProperty(name="Segments", default=3, min=1, max=10)
     sharp_angle: FloatProperty(name="Sharp Angle", default=0.523599, subtype='ANGLE')
+    limit_mode: EnumProperty(
+        name="Limit",
+        items=[
+            ('WEIGHT', "Weight", "Bevel edges by their bevel weight, so each edge "
+                                 "can be dialled or excluded on its own"),
+            ('ANGLE', "Angle", "Bevel every edge sharper than the threshold, the "
+                               "same amount everywhere"),
+        ],
+        default='WEIGHT',
+    )
     mark_sharp: BoolProperty(
         name="Auto-Mark Sharp",
         description="Rebuild sharp edges from the angle threshold (overwrites manual sharps)",
         default=True,
     )
+    reseed_weights: BoolProperty(
+        name="Re-seed Weights",
+        description="Rewrite every bevel weight from the angle threshold. Off by "
+                    "default: weights are seeded once so the result matches Angle "
+                    "mode, and hand-dialled edges survive later runs",
+        default=False,
+    )
+    vertex_bevel: BoolProperty(
+        name="Vertex Bevel",
+        description="Add a second bevel that rounds corners. It is weight-driven, "
+                    "so it does nothing until vertices are given a weight",
+        default=False,
+    )
+    vertex_width: FloatProperty(name="Vertex Width", default=0.01, min=0.0001, step=0.1,
+                                subtype='DISTANCE')
 
     @classmethod
     def poll(cls, context):
@@ -2257,48 +2303,132 @@ class OBJECT_OT_smart_bevel(bpy.types.Operator):
             self.report({'ERROR'}, "Select at least one mesh.")
             return {'CANCELLED'}
 
+        seeded = 0
         for obj in meshes:
-            self.shade(obj.data)
+            if self.shade(obj.data):
+                seeded += 1
             self.build_stack(obj)
 
-        self.report({'INFO'}, f"Applied Smart Bevel & Normals to {len(meshes)} object(s).")
+        note = f", seeded weights on {seeded}" if seeded else ""
+        self.report({'INFO'}, f"Smart Bevel on {len(meshes)} object(s)"
+                              f" in {self.limit_mode.lower()} mode{note}.")
         return {'FINISHED'}
 
     def shade(self, mesh):
-        """Smooth-shade every face and rebuild sharp edges from the angle threshold.
+        """Smooth-shade the mesh, rebuild sharp edges, and seed bevel weights.
 
         Written against mesh data rather than bpy.ops.object.shade_smooth() so it
         never touches the user's selection, and so it does not depend on the
         pre-4.1 use_auto_smooth flag (removed in Blender 4.1).
+
+        Weights are seeded from the same angle test the old Angle mode used, so
+        switching costs nothing visually, and only when they do not already
+        exist. Re-running would otherwise flatten every edge the artist had
+        dialled by hand, which is the whole point of weight mode.
         """
         mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
 
-        if self.mark_sharp:
-            bm = bmesh.new()
-            bm.from_mesh(mesh)
-            for edge in bm.edges:
-                edge.smooth = edge.calc_face_angle(0.0) < self.sharp_angle
-            bm.to_mesh(mesh)
-            bm.free()
+        seed = (self.limit_mode == 'WEIGHT'
+                and (self.reseed_weights
+                     or mesh.attributes.get(EDGE_WEIGHT_ATTR) is None))
+        if not (self.mark_sharp or seed):
+            mesh.update()
+            return False
 
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        weights = bevel_weight_layer(bm, 'EDGE') if seed else None
+
+        for edge in bm.edges:
+            sharp = edge.calc_face_angle(0.0) >= self.sharp_angle
+            if self.mark_sharp:
+                edge.smooth = not sharp
+            if weights is not None:
+                edge[weights] = 1.0 if sharp else 0.0
+
+        bm.to_mesh(mesh)
+        bm.free()
         mesh.update()
+        return seed
 
     def build_stack(self, obj):
         bevel = obj.modifiers.get(BEVEL_MOD) or obj.modifiers.new(name=BEVEL_MOD, type='BEVEL')
-        bevel.limit_method = 'ANGLE'
+        bevel.limit_method = self.limit_mode
         bevel.angle_limit = self.sharp_angle
         bevel.width = self.bevel_width
         bevel.segments = self.bevel_segments
         bevel.profile = 0.7
         bevel.miter_outer = 'MITER_ARC'
+        if hasattr(bevel, "edge_weight"):
+            bevel.edge_weight = EDGE_WEIGHT_ATTR
+
+        existing = obj.modifiers.get(VERTEX_BEVEL_MOD)
+        if self.vertex_bevel:
+            corner = existing or obj.modifiers.new(name=VERTEX_BEVEL_MOD, type='BEVEL')
+            corner.affect = 'VERTICES'
+            # Weight driven rather than every corner: bevelling all of them at
+            # once is almost never what a hard-surface piece wants.
+            corner.limit_method = 'WEIGHT'
+            corner.width = self.vertex_width
+            corner.segments = self.bevel_segments
+            if hasattr(corner, "vertex_weight"):
+                corner.vertex_weight = VERT_WEIGHT_ATTR
+        elif existing is not None:
+            obj.modifiers.remove(existing)
 
         weighted_normal = (obj.modifiers.get(WEIGHTED_NORMAL_MOD)
                            or obj.modifiers.new(name=WEIGHTED_NORMAL_MOD, type='WEIGHTED_NORMAL'))
         weighted_normal.keep_sharp = True
 
-        # Keeps weld -> bevel -> weighted normal in order at the tail, after
-        # every boolean, however the user built the stack up.
+        # Keeps weld -> bevel -> vertex bevel -> weighted normal in order at the
+        # tail, after every boolean, however the user built the stack up.
         sort_post_boolean_stack(obj)
+
+
+class MESH_OT_set_bevel_weight(bpy.types.Operator):
+    """Set the bevel weight on the selected edges or vertices"""
+    bl_idname = "mesh.set_bevel_weight"
+    bl_label = "Set Bevel Weight"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    weight: FloatProperty(
+        name="Weight",
+        description="1 bevels at the modifier's full width, 0 excludes the edge, "
+                    "and anything between scales the width for a variable fillet",
+        default=1.0, min=0.0, max=1.0, precision=3,
+    )
+    domain: EnumProperty(
+        name="Apply To",
+        items=[('EDGE', "Edges", "Drive the edge bevel"),
+               ('VERTEX', "Vertices", "Drive the vertex bevel")],
+        default='EDGE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH' and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bevel_weight_layer(bm, self.domain)
+
+        elements = bm.edges if self.domain == 'EDGE' else bm.verts
+        touched = 0
+        for element in elements:
+            if element.select:
+                element[layer] = self.weight
+                touched += 1
+
+        if not touched:
+            self.report({'WARNING'}, "Nothing selected.")
+            return {'CANCELLED'}
+
+        bmesh.update_edit_mesh(obj.data)
+        self.report({'INFO'}, f"Weight {self.weight:.2f} on {touched} "
+                              f"{self.domain.lower()}(s).")
+        return {'FINISHED'}
 
 
 class OBJECT_OT_apply_bevel_resolution(bpy.types.Operator):
@@ -3011,6 +3141,7 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.scale_y = 1.5
         row.operator(OBJECT_OT_smart_bevel.bl_idname, text="Smart Bevel")
 
+        self.draw_live_bevel(context, layout)
         self.draw_bevel_resolution(context, layout)
 
         layout.separator()
@@ -3085,6 +3216,66 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         row.scale_y = 1.5
         row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="High Poly").export_type = 'HIGH'
         row.operator(OBJECT_OT_smart_export_ue5.bl_idname, text="Low Poly").export_type = 'LOW'
+
+    @staticmethod
+    def draw_live_bevel(context, layout):
+        """The active object's own bevel settings, drawn straight from the
+        modifier. Nothing is copied or cached, so every widget here is the live
+        value and dragging one updates the viewport without running anything."""
+        active = context.active_object
+        if active is None or active.type != 'MESH':
+            return
+        bevel = active.modifiers.get(BEVEL_MOD)
+        if bevel is None:
+            return
+
+        box = layout.box()
+        box.label(text="Live Bevel", icon='MOD_BEVEL')
+        box.prop(bevel, "limit_method", text="Limit")
+
+        column = box.column(align=True)
+        column.prop(bevel, "width")
+        column.prop(bevel, "segments")
+        column.prop(bevel, "profile")
+        if bevel.limit_method == 'ANGLE':
+            column.prop(bevel, "angle_limit")
+
+        row = box.row(align=True)
+        row.prop(bevel, "harden_normals", text="Harden", toggle=True)
+        row.prop(bevel, "use_clamp_overlap", text="Clamp", toggle=True)
+        row.prop(bevel, "loop_slide", text="Slide", toggle=True)
+
+        column = box.column(align=True)
+        column.prop(bevel, "miter_outer", text="Outer")
+        column.prop(bevel, "miter_inner", text="Inner")
+        if bevel.miter_inner == 'MITER_ARC':
+            column.prop(bevel, "spread")
+
+        corner = active.modifiers.get(VERTEX_BEVEL_MOD)
+        if corner is not None:
+            sub = box.box()
+            sub.label(text="Vertex Bevel", icon='VERTEXSEL')
+            sub.prop(corner, "width")
+            sub.prop(corner, "segments")
+
+        if context.mode == 'EDIT_MESH':
+            box.separator()
+            box.label(text="Weight on selection:")
+            row = box.row(align=True)
+            for value, label in ((1.0, "Full"), (0.5, "Half"), (0.25, "Light"), (0.0, "None")):
+                entry = row.operator(MESH_OT_set_bevel_weight.bl_idname, text=label)
+                entry.weight = value
+                entry.domain = 'EDGE'
+            row = box.row(align=True)
+            row.label(text="Corners:")
+            for value, label in ((1.0, "On"), (0.0, "Off")):
+                entry = row.operator(MESH_OT_set_bevel_weight.bl_idname, text=label)
+                entry.weight = value
+                entry.domain = 'VERTEX'
+        elif bevel.limit_method == 'WEIGHT':
+            hint = box.row()
+            hint.enabled = False
+            hint.label(text="Tab into Edit Mode to dial individual edges", icon='INFO')
 
     def draw_bevel_resolution(self, context, layout):
         scene = context.scene
@@ -3206,6 +3397,7 @@ classes = (
     OBJECT_OT_smart_union,
     MESH_OT_panel_line,
     OBJECT_OT_smart_bevel,
+    MESH_OT_set_bevel_weight,
     OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
     OBJECT_OT_preflight_scan,
