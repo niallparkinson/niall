@@ -31,10 +31,11 @@ _auto_sync_suspended = False
 WELD_MOD = "Smart_Weld"
 BEVEL_MOD = "Smart_Bevel"
 WEIGHTED_NORMAL_MOD = "Smart_Weighted_Normal"
+TRIANGULATE_MOD = "Smart_Triangulate"
 
 # Modifiers that must always evaluate after every boolean, in this order.
-POST_BOOLEAN_STACK = (WELD_MOD, BEVEL_MOD, WEIGHTED_NORMAL_MOD)
-POST_BOOLEAN_TYPES = {'WELD', 'BEVEL', 'WEIGHTED_NORMAL'}
+POST_BOOLEAN_STACK = (WELD_MOD, BEVEL_MOD, WEIGHTED_NORMAL_MOD, TRIANGULATE_MOD)
+POST_BOOLEAN_TYPES = {'WELD', 'BEVEL', 'WEIGHTED_NORMAL', 'TRIANGULATE'}
 
 INVALID_FILENAME_CHARS = set('\\/:*?"<>|')
 DUPLICATE_SUFFIX = re.compile(r"\.\d{3}$")
@@ -1080,6 +1081,51 @@ def sanitize_mesh(bm, merge_distance, dissolve_degenerate, remove_loose,
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     removed["faces_delta"] = len(bm.faces) - before_faces
     return removed
+
+
+# Quad split rules. Shortest Diagonal is the game-industry default because it
+# avoids the long thin slivers that catch light badly across a flat panel.
+QUAD_METHODS = [
+    ('SHORTEST_DIAGONAL', "Shortest Diagonal", "Split across the shorter diagonal"),
+    ('BEAUTY', "Beauty", "Split for the best-shaped triangles"),
+    ('FIXED', "Fixed", "Always split first to third corner"),
+    ('FIXED_ALTERNATE', "Fixed Alternate", "Always split second to fourth corner"),
+]
+NGON_METHODS = [
+    ('BEAUTY', "Beauty", "Arrange for the best-shaped triangles"),
+    ('CLIP', "Clip", "Clip ears off in order, cheaper and less even"),
+]
+
+
+def configure_triangulation(modifier, quad_method, ngon_method, ngon_only,
+                            keep_custom_normals):
+    """Set a Triangulate modifier to the settings an engine bake wants.
+
+    keep_custom_normals defaults to off in Blender, which is what quietly
+    discards the shading the bevel and weighted normal built. min_vertices is
+    the native way to reach ngons only: 5 leaves quads whole.
+    """
+    modifier.quad_method = quad_method
+    modifier.ngon_method = ngon_method
+    modifier.min_vertices = 5 if ngon_only else 4
+    if hasattr(modifier, "keep_custom_normals"):
+        modifier.keep_custom_normals = keep_custom_normals
+    return modifier
+
+
+def ensure_triangulation(obj, quad_method, ngon_method, ngon_only,
+                         keep_custom_normals):
+    """Add or update the triangulate modifier and keep it at the end of the stack.
+
+    Last is not cosmetic: it has to evaluate after the weighted normal, or it
+    triangulates geometry whose shading has not been built yet.
+    """
+    modifier = (obj.modifiers.get(TRIANGULATE_MOD)
+                or obj.modifiers.new(name=TRIANGULATE_MOD, type='TRIANGULATE'))
+    configure_triangulation(modifier, quad_method, ngon_method, ngon_only,
+                            keep_custom_normals)
+    sort_post_boolean_stack(obj)
+    return modifier
 
 
 def sanitize_filename(name):
@@ -2378,6 +2424,100 @@ class OBJECT_OT_preflight_scan(bpy.types.Operator):
         return ", ".join(parts) if parts else "Clean"
 
 
+class OBJECT_OT_smart_triangulate(bpy.types.Operator):
+    """Freeze the mesh into triangles the way an engine will read it"""
+    bl_idname = "object.smart_triangulate"
+    bl_label = "Triangulate for Engine"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Mode",
+        items=[
+            ('MODIFIER', "Non-Destructive", "Add a Triangulate modifier at the end "
+                                            "of the stack, leaving the base mesh editable"),
+            ('APPLY', "Bake Ready", "Apply the whole stack and write triangles into "
+                                    "the mesh data"),
+        ],
+        default='MODIFIER',
+    )
+    quad_method: EnumProperty(name="Quads", items=QUAD_METHODS, default='SHORTEST_DIAGONAL')
+    ngon_method: EnumProperty(name="Ngons", items=NGON_METHODS, default='BEAUTY')
+    ngon_only: BoolProperty(
+        name="Ngons Only",
+        description="Leave quads whole and split only faces with five or more "
+                    "sides, for a wireframe that still reads in a portfolio shot",
+        default=False,
+    )
+    keep_custom_normals: BoolProperty(
+        name="Keep Custom Normals",
+        description="Carry the split normals the bevel and weighted normal built "
+                    "through the split. Blender leaves this off by default, which "
+                    "is what silently flattens the edge shading",
+        default=True,
+    )
+    keep_original: BoolProperty(
+        name="Keep Original",
+        description="Bake Ready only: leave the editable version behind as a copy",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' for obj in context.selected_objects
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "mode")
+        layout.prop(self, "quad_method")
+        layout.prop(self, "ngon_method")
+        layout.prop(self, "ngon_only")
+        layout.prop(self, "keep_custom_normals")
+        if self.mode == 'APPLY':
+            layout.prop(self, "keep_original")
+
+    def execute(self, context):
+        meshes = selected_meshes(context)
+        if not meshes:
+            self.report({'ERROR'}, "Select at least one mesh.")
+            return {'CANCELLED'}
+
+        if self.mode == 'MODIFIER':
+            for obj in meshes:
+                ensure_triangulation(obj, self.quad_method, self.ngon_method,
+                                     self.ngon_only, self.keep_custom_normals)
+            self.report({'INFO'}, f"Triangulate modifier on {len(meshes)} object(s), "
+                                  f"{self.quad_method.replace('_', ' ').lower()}.")
+            return {'FINISHED'}
+
+        shared = [obj.name for obj in meshes if obj.data.users > 1]
+        baked = 0
+        for obj in meshes:
+            if obj.data.users > 1:
+                continue
+            ensure_triangulation(obj, self.quad_method, self.ngon_method,
+                                 self.ngon_only, self.keep_custom_normals)
+            with sole_active(context, obj):
+                # convert() walks the whole stack in order, so the custom
+                # normals the weighted normal produces are still present when
+                # the triangulate modifier consumes them. Triangulating the mesh
+                # data directly would throw them away.
+                bpy.ops.object.convert(target='MESH', keep_original=self.keep_original)
+            baked += 1
+
+        if shared:
+            self.report({'WARNING'},
+                        f"Skipped {len(shared)} object(s) with shared mesh data: "
+                        f"{', '.join(shared[:3])}")
+        if not baked:
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Baked {baked} object(s) to triangles.")
+        return {'FINISHED'}
+
+
 # --- UE5 EXPORT PIPELINE -------------------------------------------------------
 
 class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
@@ -2446,6 +2586,13 @@ class OBJECT_OT_smart_export_ue5(bpy.types.Operator):
                         and source.type == 'MESH'):
                     auto_unwrap(context, temp, scene.smart_export_seam_angle,
                                 scene.smart_export_margin, True)
+                # Freeze triangles on the copy that is actually written. This
+                # is what stops the baker and the engine each choosing their
+                # own split, without committing the editable mesh to triangles.
+                if scene.smart_export_triangulate:
+                    ensure_triangulation(temp, scene.smart_export_quad_method,
+                                         'BEAUTY', False, True)
+
                 self.write_fbx(context, temp, os.path.join(export_dir, f"{name}.fbx"))
                 written += 1
             finally:
@@ -2628,6 +2775,7 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         col = layout.column(align=True)
         col.scale_y = 1.5
         col.operator(OBJECT_OT_preflight_scan.bl_idname, text="Scan & Sanitize")
+        col.operator(OBJECT_OT_smart_triangulate.bl_idname, text="Triangulate for Engine")
         active = context.active_object
         if active is not None and active.get("preflight_report"):
             note = layout.row()
@@ -2652,6 +2800,10 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
             col = layout.column(align=True)
             col.prop(scene, "smart_export_merge_distance")
             col.prop(scene, "smart_export_remove_interior")
+
+        layout.prop(scene, "smart_export_triangulate")
+        if scene.smart_export_triangulate:
+            layout.prop(scene, "smart_export_quad_method", text="Split")
 
         layout.prop(scene, "smart_export_unwrap")
 
@@ -2788,6 +2940,7 @@ classes = (
     OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
     OBJECT_OT_preflight_scan,
+    OBJECT_OT_smart_triangulate,
     OBJECT_OT_smart_export_ue5,
     VIEW3D_PT_smart_tools,
 )
@@ -2863,6 +3016,16 @@ SCENE_PROPS = {
         description="Delete faces buried inside the solid, which a union over "
                     "coplanar or non-watertight operands can leave behind",
         default=True,
+    ),
+    "smart_export_triangulate": BoolProperty(
+        name="Triangulate on Export",
+        description="Write triangles into the FBX without committing the mesh in "
+                    "Blender to them. Both the baker and the engine then read the "
+                    "same split, which is what the mismatch artifacts come from",
+        default=True,
+    ),
+    "smart_export_quad_method": EnumProperty(
+        name="Quad Split", items=QUAD_METHODS, default='SHORTEST_DIAGONAL',
     ),
     "smart_export_unwrap": BoolProperty(
         name="Unwrap Low Poly",
