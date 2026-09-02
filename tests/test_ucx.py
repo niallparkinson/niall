@@ -128,4 +128,65 @@ rep("and the offset is the authored one", abs(gaps['KEEP'].length - 1.1314) < 1e
     f"{gaps['KEEP'].length:.4f}")
 H.unregister()
 
+print("7. the archway workflow, from a bare mesh to a compound hull")
+def archway():
+    """Two legs and a span: concave, so one hull would block the opening."""
+    bpy.ops.wm.read_factory_settings(use_empty=True); H.register()
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(-1.0,0,1.0))
+    a=bpy.context.active_object; a.scale=(0.3,0.5,2.0)
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(1.0,0,1.0))
+    b=bpy.context.active_object; b.scale=(0.3,0.5,2.0)
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0,0,2.25))
+    c=bpy.context.active_object; c.scale=(2.6,0.5,0.5)
+    for o in (a,b,c): o.select_set(True)
+    bpy.context.view_layer.objects.active=c
+    bpy.ops.object.join()
+    arch=bpy.context.active_object
+    arch.name="SM_Archway_low"; arch.data.name="SM_Archway_low"
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    return arch
+
+print("1. the disabled state is real, and reachable")
+arch=archway()
+for o in bpy.context.scene.objects: o.select_set(False)
+arch.select_set(True); bpy.context.view_layer.objects.active=arch
+rep("Generate UCX unavailable with only the mesh selected",
+    not bpy.ops.object.generate_ucx.poll())
+rep("Add Hull Box IS available", bpy.ops.object.add_collision_box.poll())
+
+print("2. Add Hull Box gives something to work with")
+bpy.ops.object.add_collision_box(coverage=1.0)
+box=bpy.context.active_object
+low, high = H.mesh_bounds(arch.data, arch.matrix_world)
+blow, bhigh = H.mesh_bounds(box.data, box.matrix_world)
+rep("box covers the mesh bounds",
+    (blow-low).length < 1e-4 and (bhigh-high).length < 1e-4,
+    f"mesh {tuple(round(v,2) for v in (high-low))} box {tuple(round(v,2) for v in (bhigh-blow))}")
+rep("box is wireframe, not blocking the view", box.display_type=='WIRE')
+rep("box is the active object, ready to shape", bpy.context.active_object is box)
+
+print("3. three hulls turn the concave arch into a compound shape")
+H.unregister()
+arch=archway()
+for o in bpy.context.scene.objects: o.select_set(False)
+arch.select_set(True); bpy.context.view_layer.objects.active=arch
+hulls=[]
+for cov in (0.4, 0.4, 0.4):
+    bpy.ops.object.add_collision_box(coverage=cov)
+    hulls.append(bpy.context.active_object)
+    for o in bpy.context.scene.objects: o.select_set(False)
+    arch.select_set(True); bpy.context.view_layer.objects.active=arch
+rep("three boxes made", len(hulls)==3)
+
+for o in bpy.context.scene.objects: o.select_set(False)
+for hbox in hulls: hbox.select_set(True)
+arch.select_set(True); bpy.context.view_layer.objects.active=arch
+rep("Generate UCX now available", bpy.ops.object.generate_ucx.poll())
+bpy.ops.object.generate_ucx()
+names=sorted(c.name for c in arch.children)
+rep("named as a compound set",
+    names==["UCX_SM_Archway_low_01","UCX_SM_Archway_low_02","UCX_SM_Archway_low_03"],
+    str(names))
+H.unregister()
+
 print(f"\n{sum(R)}/{len(R)} checks pass")

@@ -2466,6 +2466,60 @@ class OBJECT_OT_preflight_scan(bpy.types.Operator):
         return ", ".join(parts) if parts else "Clean"
 
 
+class OBJECT_OT_add_collision_box(bpy.types.Operator):
+    """Add a box over the active mesh, ready to shape into a collision hull"""
+    bl_idname = "object.add_collision_box"
+    bl_label = "Add Hull Box"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    coverage: FloatProperty(
+        name="Coverage",
+        description="Size of the box as a fraction of the mesh's bounds. A "
+                    "concave shape needs several smaller boxes, so start under 1",
+        default=1.0, min=0.05, max=1.0, precision=2, step=5.0,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        return (context.mode == 'OBJECT' and active is not None
+                and active.type == 'MESH' and not is_collision(active))
+
+    def execute(self, context):
+        target = context.active_object
+        low, high = mesh_bounds(target.data, target.matrix_world)
+        if low is None:
+            self.report({'ERROR'}, f"{target.name} has no geometry to measure.")
+            return {'CANCELLED'}
+
+        centre = (low + high) * 0.5
+        size = (high - low) * self.coverage
+        # A flat mesh would give a zero-thickness box, which is no use as a hull.
+        size = Vector((max(size.x, 1e-4), max(size.y, 1e-4), max(size.z, 1e-4)))
+
+        mesh = bpy.data.meshes.new("HullBox")
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=1.0)
+        bm.to_mesh(mesh)
+        bm.free()
+
+        box = bpy.data.objects.new("HullBox", mesh)
+        context.scene.collection.objects.link(box)
+        box.matrix_world = Matrix.Translation(centre) @ Matrix.Diagonal(
+            size.to_4d())
+        # Wireframe from the start so it does not hide the mesh being covered.
+        box.display_type = 'WIRE'
+
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        box.select_set(True)
+        context.view_layer.objects.active = box
+
+        self.report({'INFO'}, "Hull box added. Shape it, then select it plus the "
+                              "mesh (mesh last) and press Generate UCX.")
+        return {'FINISHED'}
+
+
 class OBJECT_OT_generate_ucx(bpy.types.Operator):
     """Turn the selected boxes into collision hulls for the active mesh"""
     bl_idname = "object.generate_ucx"
@@ -2919,7 +2973,10 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
         col.scale_y = 1.5
         col.operator(OBJECT_OT_preflight_scan.bl_idname, text="Scan & Sanitize")
         col.operator(OBJECT_OT_smart_triangulate.bl_idname, text="Triangulate for Engine")
-        col.operator(OBJECT_OT_generate_ucx.bl_idname, text="Generate UCX")
+        row = col.row(align=True)
+        row.operator(OBJECT_OT_add_collision_box.bl_idname, text="Add Hull Box")
+        row.operator(OBJECT_OT_generate_ucx.bl_idname, text="Generate UCX")
+
         active = context.active_object
         if active is not None and active.type == 'MESH':
             hulls = collision_hulls(active)
@@ -2927,6 +2984,13 @@ class VIEW3D_PT_smart_tools(bpy.types.Panel):
                 note = layout.row()
                 note.enabled = False
                 note.label(text=f"{len(hulls)} collision hull(s) attached", icon='MESH_CUBE')
+            elif len(context.selected_objects) < 2:
+                # Generate UCX polls on having something to convert. Saying so
+                # beats a greyed-out button with no reason attached.
+                hint = layout.row()
+                hint.enabled = False
+                hint.label(text="Add a hull box, then select it and the mesh last",
+                           icon='INFO')
         active = context.active_object
         if active is not None and active.get("preflight_report"):
             note = layout.row()
@@ -3091,6 +3155,7 @@ classes = (
     OBJECT_OT_apply_bevel_resolution,
     OBJECT_OT_smart_uv,
     OBJECT_OT_preflight_scan,
+    OBJECT_OT_add_collision_box,
     OBJECT_OT_generate_ucx,
     OBJECT_OT_smart_triangulate,
     OBJECT_OT_smart_export_ue5,
