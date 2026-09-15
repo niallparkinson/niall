@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Blender
+*.blend1
+*.blend2
+tests/hstools.py
